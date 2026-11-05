@@ -14,6 +14,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager/types"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/caarlos0/log"
 	"github.com/goreleaser/goreleaser/v2/internal/artifact"
 	"github.com/goreleaser/goreleaser/v2/internal/extrafiles"
@@ -44,6 +45,9 @@ var (
 )
 
 func newProductionUploader(conf config.Blob, provider string) uploader {
+	if provider == "s3" && conf.KMSKey == "" {
+		return newS3ResumableUploader(conf)
+	}
 	up := &productionUploader{
 		cacheControl:       conf.CacheControl,
 		contentDisposition: conf.ContentDisposition,
@@ -71,6 +75,46 @@ func newProductionUploader(conf config.Blob, provider string) uploader {
 		}
 	}
 	return up
+}
+
+// newS3ResumableUploader builds the S3 uploader that resumes multipart uploads
+// based on bucket, key and content digest.
+func newS3ResumableUploader(conf config.Blob) uploader {
+	up := &s3ResumableUploader{
+		cacheControl:       conf.CacheControl,
+		contentDisposition: conf.ContentDisposition,
+	}
+	if conf.ACL != "" {
+		acl := s3types.ObjectCannedACL(conf.ACL)
+		switch acl {
+		case s3types.ObjectCannedACLPrivate,
+			s3types.ObjectCannedACLPublicRead,
+			s3types.ObjectCannedACLPublicReadWrite,
+			s3types.ObjectCannedACLAuthenticatedRead,
+			s3types.ObjectCannedACLAwsExecRead,
+			s3types.ObjectCannedACLBucketOwnerRead,
+			s3types.ObjectCannedACLBucketOwnerFullControl:
+			up.acl = acl
+		default:
+			return invalidACLUploader{acl: conf.ACL}
+		}
+	}
+	return up
+}
+
+// invalidACLUploader fails on use, preserving the previous "invalid ACL"
+// error behavior when the bucket is opened.
+type invalidACLUploader struct {
+	acl string
+}
+
+func (invalidACLUploader) Close() error                        { return nil }
+func (invalidACLUploader) Open(*context.Context, string) error { return nil }
+func (u invalidACLUploader) Upload(*context.Context, string, io.Reader) error {
+	return fmt.Errorf("invalid ACL %q", u.acl)
+}
+func (u invalidACLUploader) UploadFile(*context.Context, string, string) error {
+	return fmt.Errorf("invalid ACL %q", u.acl)
 }
 
 func urlFor(ctx *context.Context, conf config.Blob) (string, error) {
@@ -210,6 +254,15 @@ func artifactList(ctx *context.Context, conf config.Blob) []*artifact.Artifact {
 }
 
 func uploadData(ctx *context.Context, conf config.Blob, up uploader, dataFile, uploadFile, bucketURL string) error {
+	// Uploaders that own the local file (S3) hash, seek and resume it
+	// themselves; everything else keeps streaming the opened reader.
+	if fu, ok := up.(fileUploader); ok && conf.KMSKey == "" {
+		if err := fu.UploadFile(ctx, uploadFile, dataFile); err != nil {
+			return handleError(err, bucketURL)
+		}
+		return nil
+	}
+
 	data, err := openData(ctx, conf, dataFile)
 	if err != nil {
 		return err
