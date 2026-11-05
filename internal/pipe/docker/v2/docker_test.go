@@ -84,6 +84,7 @@ func TestDefault(t *testing.T) {
 	require.NotEmpty(t, d.Tags)
 	require.NotEmpty(t, d.Platforms)
 	require.Equal(t, "true", d.SBOM)
+	require.Equal(t, "true", d.Resume)
 }
 
 func TestMakeContext(t *testing.T) {

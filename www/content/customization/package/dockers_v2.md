@@ -160,6 +160,19 @@ dockers_v2:
     # {{< g_inline_version "v2.12" >}}
     sbom: "{{ not .IsNightly }}"
 
+    # Whether multi-platform publishes are resumable: each platform is built
+    # and pushed to a separate staging tag, the final tags are updated only
+    # once every configured platform is ready, and on reruns platforms that
+    # are already built and unchanged are not rebuilt.
+    #
+    # Only applies when more than one platform is configured; single
+    # platform images are always built and pushed in one step.
+    #
+    # Default: 'true'.
+    # Templates: allowed.
+    # {{< g_inline_version "v2.20" >}}
+    resume: "true"
+
     # Additional `--build-arg`s to be passed.
     #
     # Templates: allowed.
@@ -260,6 +273,93 @@ The images are then built and pushed later, when you run `goreleaser publish`,
 > [!TIP]
 > If you want to build the images without pushing them, e.g. to verify that your
 > `Dockerfile` works, run a [snapshot build](#testing-locally).
+
+## Resumable multi-platform publishing
+
+{{< g_inline_version "v2.20" >}}
+
+When a configuration targets more than one platform, GoReleaser no longer
+builds every platform in a single `docker buildx build` invocation.
+Instead, each platform is built and pushed independently, which makes
+multi-platform publishes resumable: if one platform fails (or the run is
+interrupted), rerunning the release does not redo the platforms that already
+succeeded.
+
+This behavior can be turned off with the `resume` option:
+
+```yaml
+dockers_v2:
+  - images:
+      - myuser/myimage
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    resume: "false" # optional, defaults to true
+```
+
+Single platform configurations are not affected: they keep being built and
+pushed to their final tags in one step, and no staging tags are created.
+
+### How it works
+
+For every platform in the current configuration, GoReleaser:
+
+1. calculates a **content fingerprint** from the platform's build context
+   (the `Dockerfile`, the binaries and packages for the platform, and the
+   extra files), the rendered build options (build args, flags, labels,
+   annotations, SBOM), and the current digest of the base image;
+2. derives an internal, content-addressed staging tag for the platform:
+   `goreleaser-stage-<release>-<platform>-<fingerprint>`;
+3. checks the registry for that exact tag using
+   `docker buildx imagetools inspect`: if it exists, the platform is reused
+   and not built; otherwise only that platform is built and pushed to its
+   staging tag.
+
+Only once **all** configured platforms are available does GoReleaser run
+`docker buildx imagetools create` to assemble the multi-platform manifest
+(index) and update the final tags (`v1.2.3`, `latest`, ...).
+
+Consequences:
+
+- if a platform fails, the final tags are **not** touched: they keep pointing
+  at the previous release until a rerun completes the full platform set;
+- rerunning after a failure or interruption reuses every platform that
+  already succeeded and rebuilds only the missing or changed ones;
+- platforms removed from the configuration no longer enter the final index:
+  the rerun converges to exactly the configured platforms;
+- changing the `Dockerfile`, a binary or package, build args, or the base
+  image content rebuilds only the affected platforms;
+- other tags in the repository, including tags you maintain by hand, tags of
+  other images, and other `dockers_v2` configurations, are never modified —
+  only the declared final tags and the `goreleaser-stage-*` tags are touched.
+
+SBOM attestations and per-platform annotations are preserved in the assembled
+index. Signing (e.g. cosign) and the digest file still target the final tags.
+Build hooks run once per platform; in that context `.Images` lists the
+platform's staging tags and `.Digest` is the pushed staging image digest.
+
+### Staging tags
+
+The staging tags follow a fixed scheme and live next to each configured
+image:
+
+```text
+<image>:goreleaser-stage-<release-key>-<platform>-<fingerprint>
+```
+
+- `<release-key>` identifies the release (it derives from the version and the
+  final tags);
+- `<platform>` is the platform with slashes replaced by dashes, e.g.
+  `linux-arm64`, `linux-arm-v7`;
+- `<fingerprint>` is the first 12 characters of the content fingerprint.
+
+Because the tag name contains the fingerprint, its presence in the registry
+is proof that the exact same platform image was already built. Old staging
+tags are intentionally left behind when content changes or a platform is
+removed from the configuration: they are content-addressed, never referenced
+by the final tags, and registries do not offer a portable way to delete tags.
+If desired, they can be pruned out of band by matching the
+`goreleaser-stage-` prefix.
 
 ## Testing locally
 
@@ -443,6 +543,12 @@ a single platform, such as `docker pull`, to see the annotations.
 
 Only the scopes above are recognized: any other prefix is part of the key
 itself.
+
+With [resumable multi-platform publishing](#resumable-multi-platform-publishing),
+`index` annotations are applied when the final index is assembled, while
+`manifest` and `manifest-descriptor` annotations are applied when each
+platform image is built, so they end up in exactly the same place in the final
+index.
 
 See: [Docker Docs: Annotations > Specify annotation level](https://docs.docker.com/build/metadata/annotations/#specify-annotation-level)
 

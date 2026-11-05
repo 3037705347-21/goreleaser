@@ -109,6 +109,9 @@ func (Base) Default(ctx *context.Context) error {
 		if docker.SBOM == "" {
 			docker.SBOM = "true"
 		}
+		if docker.Resume == "" {
+			docker.Resume = "true"
+		}
 		if docker.Retry.Attempts > 0 ||
 			docker.Retry.MaxDelay > 0 ||
 			docker.Retry.Delay > 0 {
@@ -179,11 +182,23 @@ func (p Publish) Publish(ctx *context.Context) error {
 	g := semerrgroup.NewSkipAware(semerrgroup.New(ctx.Parallelism))
 	for _, d := range ctx.Config.DockersV2 {
 		g.Go(func() error {
-			extraArgs, err := p.extraArgs(ctx, d)
+			resumable, err := useResumablePublish(ctx, d)
 			if err != nil {
-				return fmt.Errorf("dockers_v2.sbom: %w", err)
+				return err
 			}
-			return buildImage(ctx, d, extraArgs...)
+			if !resumable {
+				extraArgs, err := p.extraArgs(ctx, d)
+				if err != nil {
+					return fmt.Errorf("dockers_v2.sbom: %w", err)
+				}
+				return buildImage(ctx, d, extraArgs...)
+			}
+
+			rd, err := resolveDocker(ctx, d)
+			if err != nil {
+				return err
+			}
+			return publishResumable(ctx, rd)
 		})
 	}
 	err = g.Wait()
