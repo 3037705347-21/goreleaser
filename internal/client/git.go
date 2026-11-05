@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -33,10 +34,116 @@ type gitClient struct {
 }
 
 // NewGitUploadClient creates a new git client.
-func NewGitUploadClient(branch string) FilesCreator {
+func NewGitUploadClient(branch string) *gitClient {
 	return &gitClient{
 		branch: branch,
 	}
+}
+
+// gitCheckout is a prepared local checkout of the target repository.
+type gitCheckout struct {
+	cwd     string
+	env     []string
+	url     string
+	cleanup func() error
+}
+
+// checkout returns the local checkout directory for the repository, cloning it
+// and checking out the target branch when necessary. It also resolves the SSH
+// credentials and environment.
+func (g *gitClient) checkout(ctx *context.Context, repo Repo) (*gitCheckout, error) {
+	url, err := tmpl.New(ctx).Apply(repo.GitURL)
+	if err != nil {
+		return nil, fmt.Errorf("git: failed to template git url: %w", err)
+	}
+
+	if url == "" {
+		return nil, pipe.Skip("url is empty")
+	}
+
+	repo.Name = cmp.Or(repo.Name, nameFromURL(url))
+
+	key, err := tmpl.New(ctx).Apply(repo.PrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("git: failed to template private key: %w", err)
+	}
+
+	key, cleanupKey, err := keyPath(key)
+	if err != nil {
+		return nil, err
+	}
+	cleanup := func() error {
+		if cleanupKey == nil {
+			return nil
+		}
+		return cleanupKey()
+	}
+
+	sshcmd, err := tmpl.New(ctx).WithExtraFields(tmpl.Fields{
+		"KeyPath": key,
+	}).Apply(cmp.Or(repo.GitSSHCommand, DefaultGitSSHCommand))
+	if err != nil {
+		_ = cleanup()
+		return nil, fmt.Errorf("git: failed to template ssh command: %w", err)
+	}
+
+	parent := filepath.Join(ctx.Config.Dist, "git")
+	name := checkoutDirName(repo.Name, url, g.branch)
+	cwd := filepath.Join(parent, name)
+	env := []string{fmt.Sprintf("GIT_SSH_COMMAND=%s", sshcmd)}
+
+	if _, err := os.Stat(cwd); errors.Is(err, os.ErrNotExist) {
+		if err := os.MkdirAll(parent, 0o755); err != nil {
+			_ = cleanup()
+			return nil, fmt.Errorf("git: failed to create parent: %w", err)
+		}
+
+		if err := cloneRepo(ctx, parent, url, name, env); err != nil {
+			_ = cleanup()
+			return nil, err
+		}
+
+		if g.branch != "" {
+			if err := runGitCmd(ctx, cwd, env, "checkout", g.branch); err != nil {
+				if err := runGitCmd(ctx, cwd, env, "checkout", "-b", g.branch); err != nil {
+					_ = cleanup()
+					return nil, fmt.Errorf("git: could not checkout branch %s: %w", g.branch, err)
+				}
+			}
+		}
+	}
+
+	return &gitCheckout{
+		cwd:     cwd,
+		env:     env,
+		url:     url,
+		cleanup: cleanup,
+	}, nil
+}
+
+// commitIfStaged creates a commit from the staged changes. When there is
+// nothing staged, no commit is created, so retried runs after an interrupted
+// push converge instead of failing with "nothing to commit".
+func (g *gitClient) commitIfStaged(ctx *context.Context, co *gitCheckout, commitAuthor config.CommitAuthor, repo Repo, message string) error {
+	out, err := git.Clean(git.RunWithEnv(ctx, co.env, "-C", co.cwd, "diff", "--cached", "--name-only"))
+	if err != nil {
+		return fmt.Errorf("git: failed to inspect staged changes %q (%q): %w", repo.Name, co.url, err)
+	}
+	if strings.TrimSpace(out) == "" {
+		log.
+			WithField("repository", co.url).
+			WithField("name", repo.Name).
+			Debug("nothing to commit")
+		return nil
+	}
+	if err := runGitCmdWith(
+		ctx, co.cwd, co.env,
+		commitConfigFlags(commitAuthor),
+		"commit", "-m", message,
+	); err != nil {
+		return fmt.Errorf("git: failed to commit %q (%q): %w", repo.Name, co.url, err)
+	}
+	return nil
 }
 
 // CreateFiles implements FilesCreator.
@@ -50,64 +157,16 @@ func (g *gitClient) CreateFiles(
 	gil.Lock()
 	defer gil.Unlock()
 
-	url, err := tmpl.New(ctx).Apply(repo.GitURL)
-	if err != nil {
-		return fmt.Errorf("git: failed to template git url: %w", err)
-	}
-
-	if url == "" {
-		return pipe.Skip("url is empty")
-	}
-
-	repo.Name = cmp.Or(repo.Name, nameFromURL(url))
-
-	key, err := tmpl.New(ctx).Apply(repo.PrivateKey)
-	if err != nil {
-		return fmt.Errorf("git: failed to template private key: %w", err)
-	}
-
-	key, cleanupKey, err := keyPath(key)
+	co, err := g.checkout(ctx, repo)
 	if err != nil {
 		return err
 	}
-	if cleanupKey != nil {
-		defer func() {
-			err = errors.Join(err, cleanupKey())
-		}()
-	}
-
-	sshcmd, err := tmpl.New(ctx).WithExtraFields(tmpl.Fields{
-		"KeyPath": key,
-	}).Apply(cmp.Or(repo.GitSSHCommand, DefaultGitSSHCommand))
-	if err != nil {
-		return fmt.Errorf("git: failed to template ssh command: %w", err)
-	}
-
-	parent := filepath.Join(ctx.Config.Dist, "git")
-	name := checkoutDirName(repo.Name, url, g.branch)
-	cwd := filepath.Join(parent, name)
-	env := []string{fmt.Sprintf("GIT_SSH_COMMAND=%s", sshcmd)}
-
-	if _, err := os.Stat(cwd); errors.Is(err, os.ErrNotExist) {
-		if err := os.MkdirAll(parent, 0o755); err != nil {
-			return fmt.Errorf("git: failed to create parent: %w", err)
-		}
-
-		if err := cloneRepo(ctx, parent, url, name, env); err != nil {
-			return err
-		}
-
-		if g.branch != "" {
-			if err := runGitCmd(ctx, cwd, env, "checkout", g.branch); err != nil {
-				if err := runGitCmd(ctx, cwd, env, "checkout", "-b", g.branch); err != nil {
-					return fmt.Errorf("git: could not checkout branch %s: %w", g.branch, err)
-				}
-			}
-		}
-	}
+	defer func() {
+		err = errors.Join(err, co.cleanup())
+	}()
 
 	for _, file := range files {
-		location := filepath.Join(cwd, file.Path)
+		location := filepath.Join(co.cwd, file.Path)
 		log.WithField("path", location).Info("writing")
 		if err := os.MkdirAll(filepath.Dir(location), 0o755); err != nil {
 			return fmt.Errorf("failed to create parent dirs for %s: %w", file.Path, err)
@@ -116,24 +175,20 @@ func (g *gitClient) CreateFiles(
 			return fmt.Errorf("failed to write %s: %w", file.Path, err)
 		}
 		log.
-			WithField("repository", url).
+			WithField("repository", co.url).
 			WithField("name", repo.Name).
 			WithField("file", file.Path).
 			Info("pushing")
 	}
 
-	if err := runGitCmd(ctx, cwd, env, "add", "-A", "."); err != nil {
-		return fmt.Errorf("git: failed to add files %q (%q): %w", repo.Name, url, err)
+	if err := runGitCmd(ctx, co.cwd, co.env, "add", "-A", "."); err != nil {
+		return fmt.Errorf("git: failed to add files %q (%q): %w", repo.Name, co.url, err)
 	}
-	if err := runGitCmdWith(
-		ctx, cwd, env,
-		commitConfigFlags(commitAuthor),
-		"commit", "-m", message,
-	); err != nil {
-		return fmt.Errorf("git: failed to commit %q (%q): %w", repo.Name, url, err)
+	if err := g.commitIfStaged(ctx, co, commitAuthor, repo, message); err != nil {
+		return err
 	}
-	if err := pushRepo(ctx, cwd, env); err != nil {
-		return fmt.Errorf("git: failed to push %q (%q): %w", repo.Name, url, err)
+	if err := pushRepo(ctx, co.cwd, co.env); err != nil {
+		return fmt.Errorf("git: failed to push %q (%q): %w", repo.Name, co.url, err)
 	}
 
 	return nil
@@ -145,6 +200,107 @@ func (g *gitClient) CreateFile(ctx *context.Context, commitAuthor config.CommitA
 		Path:    path,
 		Content: content,
 	}})
+}
+
+// ListFiles lists the regular files directly under dir in the local checkout,
+// including their content. A missing directory yields no entries.
+func (g *gitClient) ListFiles(ctx *context.Context, repo Repo, dir string) (entries []RepoEntry, err error) {
+	gil.Lock()
+	defer gil.Unlock()
+
+	co, err := g.checkout(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		err = errors.Join(err, co.cleanup())
+	}()
+
+	dirEntries, err := os.ReadDir(filepath.Join(co.cwd, dir))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	result := make([]RepoEntry, 0, len(dirEntries))
+	for _, entry := range dirEntries {
+		if !entry.Type().IsRegular() {
+			continue
+		}
+		content, err := os.ReadFile(filepath.Join(co.cwd, dir, entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, RepoEntry{
+			Path:    path.Join(filepath.ToSlash(dir), entry.Name()),
+			Content: content,
+		})
+	}
+	return result, nil
+}
+
+// DeleteFile removes a file from the repository checkout and pushes the
+// deletion. A missing file is not an error: the pending state is pushed
+// instead, so retries after interrupted runs converge.
+func (g *gitClient) DeleteFile(
+	ctx *context.Context,
+	commitAuthor config.CommitAuthor,
+	repo Repo,
+	filePath,
+	message string,
+) (err error) {
+	gil.Lock()
+	defer gil.Unlock()
+
+	co, err := g.checkout(ctx, repo)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		err = errors.Join(err, co.cleanup())
+	}()
+
+	target := filepath.Join(co.cwd, filePath)
+	rel, err := filepath.Rel(co.cwd, target)
+	if err != nil || rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return fmt.Errorf("git: refusing to delete path outside the repository: %q", filePath)
+	}
+
+	log.
+		WithField("repository", co.url).
+		WithField("name", repo.Name).
+		WithField("file", filePath).
+		Info("deleting")
+
+	if _, statErr := os.Stat(target); statErr != nil {
+		if !errors.Is(statErr, os.ErrNotExist) {
+			return statErr
+		}
+		// The file is already gone locally (e.g. a previous attempt
+		// committed the deletion but failed while pushing). Push the pending
+		// state; the push is a no-op when the remote is up to date.
+		if err := pushRepo(ctx, co.cwd, co.env); err != nil {
+			return fmt.Errorf("git: failed to push %q (%q): %w", repo.Name, co.url, err)
+		}
+		return nil
+	}
+
+	if err := os.Remove(target); err != nil {
+		return fmt.Errorf("failed to remove %s: %w", filePath, err)
+	}
+
+	if err := runGitCmd(ctx, co.cwd, co.env, "add", "-A", "."); err != nil {
+		return fmt.Errorf("git: failed to stage deletion of %q: %w", filePath, err)
+	}
+	if err := g.commitIfStaged(ctx, co, commitAuthor, repo, message); err != nil {
+		return err
+	}
+	if err := pushRepo(ctx, co.cwd, co.env); err != nil {
+		return fmt.Errorf("git: failed to push %q (%q): %w", repo.Name, co.url, err)
+	}
+	return nil
 }
 
 func keyPath(key string) (path string, cleanup func() error, err error) {

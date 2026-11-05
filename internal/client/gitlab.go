@@ -3,6 +3,7 @@ package client
 import (
 	"cmp"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
@@ -267,6 +268,162 @@ func (c *gitlabClient) checkBranchExists(ctx *context.Context, repo Repo, branch
 	return res != nil && res.StatusCode != 404, nil
 }
 
+// resolveTargetBranch resolves the branch file operations target. When an
+// explicit branch does not exist yet, it also returns the default branch,
+// which GitLab requires as start_branch to create the target branch.
+func (c *gitlabClient) resolveTargetBranch(ctx *context.Context, projectID string, repo Repo) (branch, defaultBranch string, branchExists bool, err error) {
+	if repo.Branch != "" {
+		branch = repo.Branch
+		branchExists, err = c.checkBranchExists(ctx, repo, branch)
+		if err != nil {
+			return "", "", false, err
+		}
+
+		if !branchExists {
+			defaultBranch, err = c.getDefaultBranch(ctx, repo)
+			if err != nil {
+				return "", "", false, err
+			}
+		}
+
+		log.
+			WithField("projectID", projectID).
+			WithField("branch", branch).
+			WithField("branchExists", branchExists).
+			Debug("using given branch")
+		return branch, defaultBranch, branchExists, nil
+	}
+
+	branch, err = c.getDefaultBranch(ctx, repo)
+	if err != nil {
+		return "", "", false, err
+	}
+
+	log.
+		WithField("projectID", projectID).
+		WithField("branch", branch).
+		Debug("no branch given, using default branch")
+	return branch, branch, true, nil
+}
+
+// ListFiles lists the files directly under dir in the repository, including
+// their content. A missing directory yields no entries.
+func (c *gitlabClient) ListFiles(ctx *context.Context, repo Repo, dir string) ([]RepoEntry, error) {
+	if err := c.checkIsPrivateToken(); err != nil {
+		return nil, fmt.Errorf("list files: %w", err)
+	}
+
+	projectID := gitlabProjectID(repo)
+	branch, _, _, err := c.resolveTargetBranch(ctx, projectID, repo)
+	if err != nil {
+		return nil, err
+	}
+
+	var entries []RepoEntry
+	opts := &gitlab.ListTreeOptions{
+		ListOptions: gitlab.ListOptions{PerPage: 100},
+		Path:        &dir,
+		Ref:         &branch,
+	}
+	for {
+		nodes, resp, err := gitlabDo(ctx, func() ([]*gitlab.TreeNode, *gitlab.Response, error) {
+			return c.client.Repositories.ListTree(projectID, opts)
+		})
+		if err != nil {
+			if resp != nil && resp.StatusCode == http.StatusNotFound {
+				return nil, nil
+			}
+			return nil, err
+		}
+
+		for _, node := range nodes {
+			if node == nil || node.Type != "blob" {
+				continue
+			}
+			file, fres, ferr := gitlabDo(ctx, func() (*gitlab.File, *gitlab.Response, error) {
+				return c.client.RepositoryFiles.GetFile(projectID, node.Path, &gitlab.GetFileOptions{Ref: &branch})
+			})
+			if ferr != nil {
+				if fres == nil || fres.StatusCode != http.StatusNotFound {
+					// Never act on a file whose content could not be verified.
+					log.WithError(ferr).WithField("file", node.Path).
+						Warn("could not read repository file, skipping")
+				}
+				continue
+			}
+			content := file.Content
+			if file.Encoding == "base64" {
+				decoded, derr := base64.StdEncoding.DecodeString(content)
+				if derr != nil {
+					log.WithError(derr).WithField("file", node.Path).
+						Warn("could not decode repository file, skipping")
+					continue
+				}
+				entries = append(entries, RepoEntry{Path: node.Path, Content: decoded})
+				continue
+			}
+			entries = append(entries, RepoEntry{Path: node.Path, Content: []byte(content)})
+		}
+
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return entries, nil
+}
+
+// DeleteFile removes a file from the repository. A missing file is not an
+// error, which makes retries after interrupted publishes converge.
+func (c *gitlabClient) DeleteFile(
+	ctx *context.Context,
+	commitAuthor config.CommitAuthor,
+	repo Repo,
+	path,
+	message string,
+) error {
+	if err := c.checkIsPrivateToken(); err != nil {
+		return fmt.Errorf("delete file: %w", err)
+	}
+
+	projectID := gitlabProjectID(repo)
+	branch, defaultBranch, branchExists, err := c.resolveTargetBranch(ctx, projectID, repo)
+	if err != nil {
+		return err
+	}
+
+	deleteOpts := &gitlab.DeleteFileOptions{
+		Branch:        &branch,
+		AuthorName:    &commitAuthor.Name,
+		AuthorEmail:   &commitAuthor.Email,
+		CommitMessage: &message,
+	}
+	if !branchExists {
+		deleteOpts.StartBranch = &defaultBranch
+	}
+
+	log.
+		WithField("projectID", projectID).
+		WithField("branch", branch).
+		WithField("fileName", path).
+		Info("deleting file")
+
+	_, resp, err := gitlabDo(ctx, func() (*gitlab.Response, *gitlab.Response, error) {
+		r, e := c.client.RepositoryFiles.DeleteFile(projectID, path, deleteOpts)
+		return r, r, e
+	})
+	if err != nil && (resp == nil || resp.StatusCode != http.StatusNotFound) {
+		log.
+			WithField("fileName", path).
+			WithField("branch", branch).
+			WithField("projectID", projectID).
+			WithError(err).
+			Error("could not delete file")
+		return err
+	}
+	return nil
+}
+
 // CloseMilestone closes a given milestone.
 func (c *gitlabClient) CloseMilestone(ctx *context.Context, repo Repo, title string) error {
 	milestone, err := c.getMilestoneByTitle(ctx, repo, title)
@@ -319,49 +476,14 @@ func (c *gitlabClient) CreateFile(
 		WithField("projectID", projectID).
 		Debug("project id")
 
-	var branch, defaultBranch string
-	var branchExists bool
-	var err error
-	// Use the branch if given one
-	if repo.Branch != "" {
-		branch = repo.Branch
-		branchExists, err = c.checkBranchExists(ctx, repo, branch)
-		if err != nil {
-			return err
-		}
-
-		// Retrieving default branch because we need it for `start_branch`
-		if !branchExists {
-			defaultBranch, err = c.getDefaultBranch(ctx, repo)
-			if err != nil {
-				return err
-			}
-		}
-
-		log.
-			WithField("projectID", projectID).
-			WithField("branch", branch).
-			WithField("branchExists", branchExists).
-			Debug("using given branch")
-	} else {
-		// Try to get the default branch from the Git provider
-		branch, err = c.getDefaultBranch(ctx, repo)
-		if err != nil {
-			return err
-		}
-
-		defaultBranch = branch
-		branchExists = true
-
-		log.
-			WithField("projectID", projectID).
-			WithField("branch", branch).
-			Debug("no branch given, using default branch")
+	branch, defaultBranch, branchExists, err := c.resolveTargetBranch(ctx, projectID, repo)
+	if err != nil {
+		return err
 	}
 
-	// If the branch doesn't exist, we need to check the default branch
-	// because that's what we use as `start_branch` later if the file needs
-	// to be created.
+	// If the branch doesn't exist yet, files must be read from the default
+	// branch: that's what we use as `start_branch` later if the file needs to
+	// be created.
 	opts := &gitlab.GetFileOptions{Ref: &defaultBranch}
 	if branchExists {
 		opts.Ref = &branch

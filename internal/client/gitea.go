@@ -227,6 +227,115 @@ func (c *giteaClient) CreateFile(
 	return err
 }
 
+// giteaTargetBranch resolves the branch used for file operations, defaulting
+// to the server-side default branch.
+func (c *giteaClient) giteaTargetBranch(ctx *context.Context, repo Repo) string {
+	if repo.Branch != "" {
+		return repo.Branch
+	}
+	branch, err := c.getDefaultBranch(ctx, repo)
+	if err != nil {
+		// leave branch empty so the Gitea API uses the repo's
+		// server-side default branch.
+		log.WithField("projectID", repo.String()).
+			WithError(err).
+			Warn("error checking for default branch, using server default")
+		return ""
+	}
+	return branch
+}
+
+// ListFiles lists the files directly under dir in the repository, including
+// their content. A missing directory yields no entries.
+func (c *giteaClient) ListFiles(ctx *context.Context, repo Repo, dir string) ([]RepoEntry, error) {
+	branch := c.giteaTargetBranch(ctx, repo)
+
+	contents, resp, err := giteaDo(ctx, func() ([]*gitea.ContentsResponse, *gitea.Response, error) {
+		return c.client.ListContents(repo.Owner, repo.Name, branch, dir)
+	})
+	if err != nil {
+		if resp != nil && resp.StatusCode == http.StatusNotFound {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	entries := make([]RepoEntry, 0, len(contents))
+	for _, item := range contents {
+		if item == nil || item.Type != "file" {
+			continue
+		}
+		content, _, err := giteaDo(ctx, func() ([]byte, *gitea.Response, error) {
+			return c.client.GetRawFile(repo.Owner, repo.Name, item.Path, branch)
+		})
+		if err != nil {
+			// Never act on a file whose content could not be verified.
+			log.WithError(err).WithField("file", item.Path).
+				Warn("could not read repository file, skipping")
+			continue
+		}
+		entries = append(entries, RepoEntry{
+			Path:    item.Path,
+			Content: content,
+		})
+	}
+	return entries, nil
+}
+
+// DeleteFile removes a file from the repository. A missing file is not an
+// error, which makes retries after interrupted publishes converge.
+func (c *giteaClient) DeleteFile(
+	ctx *context.Context,
+	commitAuthor config.CommitAuthor,
+	repo Repo,
+	path,
+	message string,
+) error {
+	branch := c.giteaTargetBranch(ctx, repo)
+
+	currentFile, getResp, err := giteaDo(ctx, func() (*gitea.ContentsResponse, *gitea.Response, error) {
+		return c.client.GetContents(repo.Owner, repo.Name, branch, path)
+	})
+	if err != nil {
+		if getResp != nil && getResp.StatusCode == http.StatusNotFound {
+			return nil
+		}
+		return err
+	}
+
+	log.
+		WithField("repository", repo.String()).
+		WithField("branch", branch).
+		WithField("file", path).
+		Info("deleting")
+
+	_, dresp, derr := giteaDo(ctx, func() (*gitea.Response, *gitea.Response, error) {
+		r, e := c.client.DeleteFile(repo.Owner, repo.Name, path, gitea.DeleteFileOptions{
+			FileOptions: gitea.FileOptions{
+				Message:    message,
+				BranchName: branch,
+				Author: gitea.Identity{
+					Name:  commitAuthor.Name,
+					Email: commitAuthor.Email,
+				},
+				Committer: gitea.Identity{
+					Name:  commitAuthor.Name,
+					Email: commitAuthor.Email,
+				},
+			},
+			SHA: currentFile.SHA,
+		})
+		return r, r, e
+	})
+	if derr != nil {
+		if dresp != nil && dresp.StatusCode == http.StatusNotFound {
+			return nil
+		}
+		return derr
+	}
+	return nil
+}
+
 func (c *giteaClient) createRelease(ctx *context.Context, title, body string) (*gitea.Release, error) {
 	releaseConfig := ctx.Config.Release
 	owner := releaseConfig.Gitea.Owner

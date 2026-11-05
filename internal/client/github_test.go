@@ -3019,3 +3019,123 @@ func githubSecondaryRateLimitResponse(w http.ResponseWriter, retryAfter string) 
 	w.WriteHeader(http.StatusForbidden)
 	fmt.Fprint(w, `{"message":"You have exceeded a secondary rate limit","documentation_url":"https://docs.github.com/rest/overview/rate-limits-for-the-rest-api#about-secondary-rate-limits"}`)
 }
+
+func TestGitHubListFiles(t *testing.T) {
+	t.Parallel()
+	srv := githubTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		switch {
+		case r.URL.Path == "/api/v3/repos/someone/something" && r.Method == http.MethodGet:
+			fmt.Fprint(w, `{"default_branch":"main"}`)
+		case r.URL.Path == "/api/v3/repos/someone/something/contents/Casks" && r.Method == http.MethodGet:
+			fmt.Fprint(w, `[
+				{"name":"old.rb","path":"Casks/old.rb","type":"file"},
+				{"name":"manual.rb","path":"Casks/manual.rb","type":"file"},
+				{"name":"sub","path":"Casks/sub","type":"dir"}
+			]`)
+		case r.URL.Path == "/api/v3/repos/someone/something/contents/Casks/old.rb" && r.Method == http.MethodGet:
+			fmt.Fprintf(w, `{"path":"Casks/old.rb","type":"file","encoding":"base64","content":%q}`, base64.StdEncoding.EncodeToString([]byte("old")))
+		case r.URL.Path == "/api/v3/repos/someone/something/contents/Casks/manual.rb" && r.Method == http.MethodGet:
+			fmt.Fprintf(w, `{"path":"Casks/manual.rb","type":"file","encoding":"base64","content":%q}`, base64.StdEncoding.EncodeToString([]byte("manual")))
+		default:
+			t.Error("unhandled request: " + r.Method + " " + r.URL.Path)
+		}
+	})
+
+	ctx := testctx.WrapWithCfg(t.Context(), config.Project{
+		GitHubURLs: config.GitHubURLs{API: srv.URL},
+	})
+	c, err := newGitHub(ctx, "test-token")
+	require.NoError(t, err)
+
+	entries, err := c.ListFiles(ctx, Repo{Owner: "someone", Name: "something"}, "Casks")
+	require.NoError(t, err)
+
+	paths := map[string]string{}
+	for _, entry := range entries {
+		paths[entry.Path] = string(entry.Content)
+	}
+	require.Equal(t, "old", paths["Casks/old.rb"])
+	require.Equal(t, "manual", paths["Casks/manual.rb"])
+	require.NotContains(t, paths, "Casks/sub", "directories must not be listed as files")
+}
+
+func TestGitHubListFilesMissingDirectory(t *testing.T) {
+	t.Parallel()
+	srv := githubTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		switch {
+		case r.URL.Path == "/api/v3/repos/someone/something" && r.Method == http.MethodGet:
+			fmt.Fprint(w, `{"default_branch":"main"}`)
+		case strings.HasPrefix(r.URL.Path, "/api/v3/repos/someone/something/contents/") && r.Method == http.MethodGet:
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			t.Error("unhandled request: " + r.Method + " " + r.URL.Path)
+		}
+	})
+
+	ctx := testctx.WrapWithCfg(t.Context(), config.Project{
+		GitHubURLs: config.GitHubURLs{API: srv.URL},
+	})
+	c, err := newGitHub(ctx, "test-token")
+	require.NoError(t, err)
+
+	entries, err := c.ListFiles(ctx, Repo{Owner: "someone", Name: "something"}, "Casks")
+	require.NoError(t, err)
+	require.Empty(t, entries)
+}
+
+func TestGitHubDeleteFile(t *testing.T) {
+	t.Parallel()
+	var deleted bool
+	srv := githubTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		switch {
+		case r.URL.Path == "/api/v3/repos/someone/something" && r.Method == http.MethodGet:
+			fmt.Fprint(w, `{"default_branch":"main"}`)
+		case r.URL.Path == "/api/v3/repos/someone/something/contents/Casks/old.rb" && r.Method == http.MethodGet:
+			fmt.Fprint(w, `{"path":"Casks/old.rb","sha":"deadbeef","type":"file"}`)
+		case r.URL.Path == "/api/v3/repos/someone/something/contents/Casks/old.rb" && r.Method == http.MethodDelete:
+			deleted = true
+			fmt.Fprint(w, `{}`)
+		default:
+			t.Error("unhandled request: " + r.Method + " " + r.URL.Path)
+		}
+	})
+
+	ctx := testctx.WrapWithCfg(t.Context(), config.Project{
+		GitHubURLs: config.GitHubURLs{API: srv.URL},
+	})
+	c, err := newGitHub(ctx, "test-token")
+	require.NoError(t, err)
+	repo := Repo{Owner: "someone", Name: "something", Branch: "main"}
+
+	require.NoError(t, c.DeleteFile(ctx, config.CommitAuthor{Name: "user", Email: "u@e.com"}, repo, "Casks/old.rb", "retire"))
+	require.True(t, deleted)
+}
+
+func TestGitHubDeleteFileAlreadyMissing(t *testing.T) {
+	t.Parallel()
+	srv := githubTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		switch {
+		case r.URL.Path == "/api/v3/repos/someone/something" && r.Method == http.MethodGet:
+			fmt.Fprint(w, `{"default_branch":"main"}`)
+		case r.URL.Path == "/api/v3/repos/someone/something/contents/Casks/old.rb" && r.Method == http.MethodGet:
+			w.WriteHeader(http.StatusNotFound)
+		case r.URL.Path == "/api/v3/repos/someone/something/contents/Casks/old.rb" && r.Method == http.MethodDelete:
+			t.Error("must not delete a file that does not exist")
+		default:
+			t.Error("unhandled request: " + r.Method + " " + r.URL.Path)
+		}
+	})
+
+	ctx := testctx.WrapWithCfg(t.Context(), config.Project{
+		GitHubURLs: config.GitHubURLs{API: srv.URL},
+	})
+	c, err := newGitHub(ctx, "test-token")
+	require.NoError(t, err)
+	repo := Repo{Owner: "someone", Name: "something", Branch: "main"}
+
+	require.NoError(t, c.DeleteFile(ctx, config.CommitAuthor{}, repo, "Casks/old.rb", "retire"))
+}

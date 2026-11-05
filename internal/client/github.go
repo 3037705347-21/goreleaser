@@ -517,6 +517,170 @@ func (c *githubClient) CreateFile(
 	return nil
 }
 
+// targetBranch returns the branch the repository operations target, resolving
+// an empty branch to the repository's default branch.
+func (c *githubClient) targetBranch(ctx *context.Context, repo Repo) (string, error) {
+	if repo.Branch != "" {
+		return repo.Branch, nil
+	}
+	defBranch, err := c.getDefaultBranch(ctx, repo)
+	if err != nil {
+		return "", fmt.Errorf("could not get default branch: %w", err)
+	}
+	return defBranch, nil
+}
+
+// ListFiles lists the files directly under dir in the repository, including
+// their content. A missing directory yields no entries.
+func (c *githubClient) ListFiles(ctx *context.Context, repo Repo, dir string) ([]RepoEntry, error) {
+	c.checkRateLimit(ctx)
+	branch, err := c.targetBranch(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+
+	type contentsResult struct {
+		file     *github.RepositoryContent
+		contents []*github.RepositoryContent
+	}
+	got, res, err := githubDo(ctx, func() (contentsResult, *github.Response, error) {
+		file, contents, resp, gerr := c.client.Repositories.GetContents(
+			ctx,
+			repo.Owner,
+			repo.Name,
+			dir,
+			&github.RepositoryContentGetOptions{Ref: branch},
+		)
+		return contentsResult{file: file, contents: contents}, resp, gerr
+	})
+	if err != nil {
+		if res != nil && res.StatusCode == http.StatusNotFound {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("could not list %q: %w", dir, err)
+	}
+	// A regular file instead of a directory: nothing to reconcile.
+	if got.file != nil {
+		return nil, nil
+	}
+
+	entries := make([]RepoEntry, 0, len(got.contents))
+	for _, rc := range got.contents {
+		if rc == nil || rc.GetType() != "file" {
+			continue
+		}
+		content, err := c.readFileContent(ctx, repo, rc.GetPath(), branch)
+		if err != nil {
+			// Never act on a file whose content could not be verified.
+			log.WithError(err).WithField("file", rc.GetPath()).
+				Warn("could not read repository file, skipping")
+			continue
+		}
+		entries = append(entries, RepoEntry{
+			Path:    rc.GetPath(),
+			Content: content,
+		})
+	}
+	return entries, nil
+}
+
+func (c *githubClient) readFileContent(ctx *context.Context, repo Repo, path, branch string) ([]byte, error) {
+	file, res, err := githubDo(ctx, func() (*github.RepositoryContent, *github.Response, error) {
+		content, _, r, gerr := c.client.Repositories.GetContents(
+			ctx,
+			repo.Owner,
+			repo.Name,
+			path,
+			&github.RepositoryContentGetOptions{Ref: branch},
+		)
+		return content, r, gerr
+	})
+	if err != nil {
+		if res != nil && res.StatusCode == http.StatusNotFound {
+			return nil, nil
+		}
+		return nil, err
+	}
+	content, err := file.GetContent()
+	if err != nil {
+		return nil, err
+	}
+	return []byte(content), nil
+}
+
+// DeleteFile removes a file from the repository. A missing file is not an
+// error, which makes retries after interrupted publishes converge.
+func (c *githubClient) DeleteFile(
+	ctx *context.Context,
+	commitAuthor config.CommitAuthor,
+	repo Repo,
+	path,
+	message string,
+) error {
+	c.checkRateLimit(ctx)
+	branch, err := c.targetBranch(ctx, repo)
+	if err != nil {
+		return err
+	}
+
+	file, res, err := githubDo(ctx, func() (*github.RepositoryContent, *github.Response, error) {
+		content, _, r, gerr := c.client.Repositories.GetContents(
+			ctx,
+			repo.Owner,
+			repo.Name,
+			path,
+			&github.RepositoryContentGetOptions{Ref: branch},
+		)
+		return content, r, gerr
+	})
+	if err != nil {
+		if res != nil && res.StatusCode == http.StatusNotFound {
+			return nil
+		}
+		return fmt.Errorf("could not get %q: %w", path, err)
+	}
+	if file == nil {
+		return nil
+	}
+
+	options := &github.RepositoryContentFileOptions{
+		Message: &message,
+		SHA:     file.SHA,
+		Branch:  &branch,
+	}
+
+	// When using a GitHub App token, omit the committer to get automatic signed commits.
+	if !commitAuthor.UseGitHubAppToken {
+		options.Committer = &github.CommitAuthor{
+			Name:  &commitAuthor.Name,
+			Email: &commitAuthor.Email,
+		}
+	}
+
+	log.
+		WithField("repository", repo.String()).
+		WithField("branch", branch).
+		WithField("file", path).
+		Info("deleting")
+
+	if _, dres, derr := githubDo(ctx, func() (*github.RepositoryContentResponse, *github.Response, error) {
+		d, r, gerr := c.client.Repositories.DeleteFile(
+			ctx,
+			repo.Owner,
+			repo.Name,
+			path,
+			options,
+		)
+		return d, r, gerr
+	}); derr != nil {
+		if dres != nil && dres.StatusCode == http.StatusNotFound {
+			return nil
+		}
+		return fmt.Errorf("could not delete %q: %w", path, derr)
+	}
+	return nil
+}
+
 func (c *githubClient) CreateRelease(ctx *context.Context, body string) (string, error) {
 	tpl := tmpl.New(ctx)
 	title, err := tpl.Apply(ctx.Config.Release.NameTemplate)

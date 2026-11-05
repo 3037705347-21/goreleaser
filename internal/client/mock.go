@@ -17,6 +17,8 @@ var (
 	_ PullRequestOpener     = &Mock{}
 	_ ForkSyncer            = &Mock{}
 	_ ReleaseChecker        = &Mock{}
+	_ DirectoryLister       = &Mock{}
+	_ FileDeleter           = &Mock{}
 )
 
 func NewMock() *Mock {
@@ -45,6 +47,18 @@ type Mock struct {
 	ReleaseNotesParams   []string
 	OpenedPullRequest    bool
 	SyncedFork           bool
+
+	// Files are the files returned by ListFiles, keyed by directory. When the
+	// directory is not present in the map, an empty list is returned.
+	Files map[string][]RepoEntry
+	// ListedDirs records every directory passed to ListFiles.
+	ListedDirs []string
+	// DeletedFiles records every path passed to DeleteFile.
+	DeletedFiles []string
+	// DeletedMessages records the commit message used for each deletion.
+	DeletedMessages []string
+	FailToListFiles bool
+	FailToDelete    bool
 }
 
 func (c *Mock) SyncFork(_ *context.Context, _ Repo, _ Repo) error {
@@ -108,6 +122,34 @@ func (c *Mock) CreateFile(_ *context.Context, _ config.CommitAuthor, _ Repo, con
 	c.Content = string(content)
 	c.Path = path
 	c.Messages = append(c.Messages, msg)
+	return nil
+}
+
+func (c *Mock) ListFiles(_ *context.Context, _ Repo, dir string) ([]RepoEntry, error) {
+	c.ListedDirs = append(c.ListedDirs, dir)
+	if c.FailToListFiles {
+		return nil, errors.New("could not list files")
+	}
+	return c.Files[dir], nil
+}
+
+func (c *Mock) DeleteFile(_ *context.Context, _ config.CommitAuthor, _ Repo, path, msg string) error {
+	if c.FailToDelete {
+		return errors.New("could not delete file")
+	}
+	c.DeletedFiles = append(c.DeletedFiles, path)
+	c.DeletedMessages = append(c.DeletedMessages, msg)
+	// Mimic the remote repository: subsequent listings no longer contain the
+	// deleted file.
+	for dir, files := range c.Files {
+		kept := files[:0]
+		for _, file := range files {
+			if file.Path != path {
+				kept = append(kept, file)
+			}
+		}
+		c.Files[dir] = kept
+	}
 	return nil
 }
 

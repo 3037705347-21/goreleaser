@@ -93,6 +93,27 @@ type FilesCreator interface {
 	CreateFiles(ctx *context.Context, commitAuthor config.CommitAuthor, repo Repo, message string, files []RepoFile) (err error)
 }
 
+// RepoEntry is a file found inside a repository directory, including its
+// content.
+type RepoEntry struct {
+	Path    string
+	Content []byte
+}
+
+// DirectoryLister can list the files directly under a directory in a
+// repository on the given ref. Missing directories yield no entries and no
+// error.
+type DirectoryLister interface {
+	ListFiles(ctx *context.Context, repo Repo, dir string) ([]RepoEntry, error)
+}
+
+// FileDeleter can remove a file from a repository. Deleting a file that no
+// longer exists is not an error, so callers can safely retry deletions after
+// interrupted runs.
+type FileDeleter interface {
+	DeleteFile(ctx *context.Context, commitAuthor config.CommitAuthor, repo Repo, path, message string) error
+}
+
 // ReleaseNotesGenerator can generate release notes.
 type ReleaseNotesGenerator interface {
 	GenerateReleaseNotes(ctx *context.Context, repo Repo, prev, current string) (string, error)

@@ -1296,3 +1296,116 @@ func TestGiteaPublishRelease(t *testing.T) {
 	ctx := testctx.Wrap(t.Context())
 	require.NoError(t, client.PublishRelease(ctx, "123"))
 }
+
+func TestGiteaListFiles(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		switch {
+		case r.URL.Path == "/api/v1/version":
+			fmt.Fprint(w, `{"version":"1.12.0"}`)
+		case r.URL.Path == "/api/v1/repos/owner/repo/contents/Casks" && r.Method == http.MethodGet:
+			fmt.Fprint(w, `[
+				{"name":"old.rb","path":"Casks/old.rb","sha":"a","type":"file"},
+				{"name":"manual.rb","path":"Casks/manual.rb","sha":"b","type":"file"},
+				{"name":"sub","path":"Casks/sub","sha":"c","type":"dir"}
+			]`)
+		case r.URL.Path == "/api/v1/repos/owner/repo/raw/Casks/old.rb" && r.Method == http.MethodGet:
+			fmt.Fprint(w, "old")
+		case r.URL.Path == "/api/v1/repos/owner/repo/raw/Casks/manual.rb" && r.Method == http.MethodGet:
+			fmt.Fprint(w, "manual")
+		default:
+			t.Error("unhandled request: " + r.Method + " " + r.URL.Path)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	ctx := testctx.WrapWithCfg(t.Context(), config.Project{GiteaURLs: config.GiteaURLs{API: srv.URL}})
+	c, err := newGitea(ctx, "giteatoken")
+	require.NoError(t, err)
+
+	entries, err := c.ListFiles(ctx, Repo{Owner: "owner", Name: "repo", Branch: "main"}, "Casks")
+	require.NoError(t, err)
+	paths := map[string]string{}
+	for _, entry := range entries {
+		paths[entry.Path] = string(entry.Content)
+	}
+	require.Equal(t, "old", paths["Casks/old.rb"])
+	require.Equal(t, "manual", paths["Casks/manual.rb"])
+	require.NotContains(t, paths, "Casks/sub")
+}
+
+func TestGiteaListFilesMissingDirectory(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		switch {
+		case r.URL.Path == "/api/v1/version":
+			fmt.Fprint(w, `{"version":"1.12.0"}`)
+		case r.URL.Path == "/api/v1/repos/owner/repo/contents/Casks" && r.Method == http.MethodGet:
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"message":"not found"}`)
+		default:
+			t.Error("unhandled request: " + r.Method + " " + r.URL.Path)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	ctx := testctx.WrapWithCfg(t.Context(), config.Project{GiteaURLs: config.GiteaURLs{API: srv.URL}})
+	c, err := newGitea(ctx, "giteatoken")
+	require.NoError(t, err)
+
+	entries, err := c.ListFiles(ctx, Repo{Owner: "owner", Name: "repo", Branch: "main"}, "Casks")
+	require.NoError(t, err)
+	require.Empty(t, entries)
+}
+
+func TestGiteaDeleteFile(t *testing.T) {
+	t.Parallel()
+	var deleted bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		switch {
+		case r.URL.Path == "/api/v1/version":
+			fmt.Fprint(w, `{"version":"1.12.0"}`)
+		case r.URL.Path == "/api/v1/repos/owner/repo/contents/Casks/old.rb" && r.Method == http.MethodGet:
+			fmt.Fprint(w, `{"name":"old.rb","path":"Casks/old.rb","sha":"deadbeef","type":"file"}`)
+		case r.URL.Path == "/api/v1/repos/owner/repo/contents/Casks/old.rb" && r.Method == http.MethodDelete:
+			deleted = true
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Error("unhandled request: " + r.Method + " " + r.URL.Path)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	ctx := testctx.WrapWithCfg(t.Context(), config.Project{GiteaURLs: config.GiteaURLs{API: srv.URL}})
+	c, err := newGitea(ctx, "giteatoken")
+	require.NoError(t, err)
+	repo := Repo{Owner: "owner", Name: "repo", Branch: "main"}
+
+	require.NoError(t, c.DeleteFile(ctx, config.CommitAuthor{Name: "user", Email: "u@e.com"}, repo, "Casks/old.rb", "retire"))
+	require.True(t, deleted)
+}
+
+func TestGiteaDeleteFileAlreadyMissing(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		switch {
+		case r.URL.Path == "/api/v1/version":
+			fmt.Fprint(w, `{"version":"1.12.0"}`)
+		case r.URL.Path == "/api/v1/repos/owner/repo/contents/Casks/old.rb" && r.Method == http.MethodGet:
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"message":"not found"}`)
+		case r.URL.Path == "/api/v1/repos/owner/repo/contents/Casks/old.rb" && r.Method == http.MethodDelete:
+			t.Error("must not delete a file that does not exist")
+		default:
+			t.Error("unhandled request: " + r.Method + " " + r.URL.Path)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	ctx := testctx.WrapWithCfg(t.Context(), config.Project{GiteaURLs: config.GiteaURLs{API: srv.URL}})
+	c, err := newGitea(ctx, "giteatoken")
+	require.NoError(t, err)
+	repo := Repo{Owner: "owner", Name: "repo", Branch: "main"}
+
+	require.NoError(t, c.DeleteFile(ctx, config.CommitAuthor{}, repo, "Casks/old.rb", "retire"))
+}

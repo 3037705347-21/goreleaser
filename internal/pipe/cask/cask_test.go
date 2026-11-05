@@ -1,6 +1,7 @@
 package cask
 
 import (
+	"bytes"
 	_ "embed"
 	"fmt"
 	"os"
@@ -2216,4 +2217,237 @@ func TestRunPipeWrappedInArtifactSources(t *testing.T) {
 			golden.RequireEqualRb(t, golden.RequireReadFile(t, casks[0].Path))
 		})
 	}
+}
+
+func generatedCaskFile(name string) client.RepoEntry {
+	return client.RepoEntry{
+		Path:    "Casks/" + name + ".rb",
+		Content: []byte(generatedCaskMarker + "\ncask \"" + name + "\" do\nend\n"),
+	}
+}
+
+func manualCaskFile(name string) client.RepoEntry {
+	return client.RepoEntry{
+		Path:    "Casks/" + name + ".rb",
+		Content: []byte("cask \"" + name + "\" do\nend\n"),
+	}
+}
+
+// newRetirementCtx builds a context with the given cask configs and runs the
+// cask pipe's Run phase, leaving dist files and BrewCask artifacts ready for
+// publishAll.
+func newRetirementCtx(t *testing.T, casks []config.HomebrewCask) (*context.Context, *client.Mock) {
+	t.Helper()
+	folder := t.TempDir()
+	ctx := testctx.WrapWithCfg(t.Context(),
+		config.Project{
+			Dist:        folder,
+			ProjectName: "foo",
+			Casks:       casks,
+		},
+		testctx.WithVersion("1.0.1"),
+		testctx.WithCurrentTag("v1.0.1"))
+
+	path := filepath.Join(folder, "bin.tar.gz")
+	require.NoError(t, os.WriteFile(path, []byte("foo"), 0o644))
+	ctx.Artifacts.Add(&artifact.Artifact{
+		Name:    "bin.tar.gz",
+		Path:    path,
+		Goos:    "darwin",
+		Goarch:  "amd64",
+		Goamd64: "v1",
+		Type:    artifact.UploadableArchive,
+		Extra: map[string]any{
+			artifact.ExtraID:       "foo",
+			artifact.ExtraFormat:   "tar.gz",
+			artifact.ExtraBinaries: []string{"foo"},
+		},
+	})
+
+	cli := client.NewMock()
+	require.NoError(t, Pipe{}.Default(ctx))
+	require.NoError(t, runAll(ctx, cli))
+	return ctx, cli
+}
+
+func retirementCask(name, directory, skipUpload string) config.HomebrewCask {
+	cask := config.HomebrewCask{
+		Name:        name,
+		Description: "Foo bar",
+		Homepage:    "https://goreleaser.com",
+		Binaries:    []string{"foo"},
+		Directory:   directory,
+		Repository: config.RepoRef{
+			Owner: "foo",
+			Name:  "bar",
+		},
+		IDs: []string{"foo"},
+	}
+	if skipUpload != "" {
+		cask.SkipUpload = skipUpload
+	}
+	return cask
+}
+
+func remotePaths(cli *client.Mock, dir string) map[string]bool {
+	paths := map[string]bool{}
+	for _, file := range cli.Files[dir] {
+		paths[file.Path] = true
+	}
+	return paths
+}
+
+func TestPublishRetiresRenamedCask(t *testing.T) {
+	ctx, cli := newRetirementCtx(t, []config.HomebrewCask{
+		retirementCask("newname", "", ""),
+	})
+
+	cli.Files = map[string][]client.RepoEntry{
+		"Casks": {
+			generatedCaskFile("oldname"),
+			generatedCaskFile("newname"),
+			manualCaskFile("manual"),
+			{Path: "Casks/README.md", Content: []byte("hand maintained notes")},
+		},
+	}
+
+	require.NoError(t, publishAll(ctx, cli))
+
+	// the current identity is what gets written
+	require.Equal(t, "Casks/newname.rb", cli.Path)
+	// only the previously generated, now gone cask is retired
+	require.Equal(t, []string{"Casks/oldname.rb"}, cli.DeletedFiles)
+
+	remote := remotePaths(cli, "Casks")
+	require.True(t, remote["Casks/newname.rb"])
+	require.True(t, remote["Casks/manual.rb"], "hand maintained cask must not be touched")
+	require.True(t, remote["Casks/README.md"], "non-cask files must not be touched")
+	require.False(t, remote["Casks/oldname.rb"])
+}
+
+func TestPublishKeepsBehaviorWhenNoCaskWasRenamed(t *testing.T) {
+	ctx, cli := newRetirementCtx(t, []config.HomebrewCask{
+		retirementCask("foo", "", ""),
+	})
+
+	cli.Files = map[string][]client.RepoEntry{
+		"Casks": {
+			generatedCaskFile("foo"),
+			manualCaskFile("manual"),
+		},
+	}
+
+	require.NoError(t, publishAll(ctx, cli))
+	require.Empty(t, cli.DeletedFiles)
+	require.Equal(t, "Casks/foo.rb", cli.Path)
+}
+
+func TestPublishRetirementConvergesOnRetry(t *testing.T) {
+	ctx, cli := newRetirementCtx(t, []config.HomebrewCask{
+		retirementCask("newname", "", ""),
+	})
+	cli.Files = map[string][]client.RepoEntry{
+		"Casks": {
+			generatedCaskFile("oldname"),
+			generatedCaskFile("newname"),
+		},
+	}
+
+	// a first attempt fails while retiring the stale cask.
+	cli.FailToDelete = true
+	require.ErrorContains(t, publishAll(ctx, cli), "could not delete file")
+	require.Equal(t, "Casks/newname.rb", cli.Path, "current cask must be published before any deletion")
+
+	// retrying converges to the same file set and does not fail.
+	cli.FailToDelete = false
+	require.NoError(t, publishAll(ctx, cli))
+	require.Equal(t, []string{"Casks/oldname.rb"}, cli.DeletedFiles)
+
+	// publishing yet again must not retire anything else.
+	require.NoError(t, publishAll(ctx, cli))
+	require.Equal(t, []string{"Casks/oldname.rb"}, cli.DeletedFiles)
+}
+
+func TestPublishDoesNotRetireWhenGroupHasSkippedCask(t *testing.T) {
+	ctx, cli := newRetirementCtx(t, []config.HomebrewCask{
+		retirementCask("foo", "", ""),
+		retirementCask("bar", "", "true"),
+	})
+	cli.Files = map[string][]client.RepoEntry{
+		"Casks": {
+			generatedCaskFile("foo"),
+			generatedCaskFile("gone"),
+		},
+	}
+
+	// the skipped cask surfaces as a skip, just like before.
+	require.EqualError(t, publishAll(ctx, cli), `brew.skip_upload is set`)
+
+	require.True(t, cli.CreatedFile, "non-skipped cask must still be published")
+	require.Empty(t, cli.ListedDirs, "the tap directory must not be reconciled when the desired set is partial")
+	require.Empty(t, cli.DeletedFiles)
+}
+
+func TestPublishRetirementIsScopedToDirectory(t *testing.T) {
+	ctx, cli := newRetirementCtx(t, []config.HomebrewCask{
+		retirementCask("foo", "CustomCasks", ""),
+	})
+	cli.Files = map[string][]client.RepoEntry{
+		"CustomCasks": {
+			{
+				Path:    "CustomCasks/old.rb",
+				Content: []byte(generatedCaskMarker + "\ncask \"old\" do\nend\n"),
+			},
+		},
+		"Casks": {
+			generatedCaskFile("other"),
+		},
+	}
+
+	require.NoError(t, publishAll(ctx, cli))
+	require.Equal(t, []string{"CustomCasks/old.rb"}, cli.DeletedFiles)
+	require.Contains(t, cli.ListedDirs, "CustomCasks")
+	require.NotContains(t, cli.ListedDirs, "Casks")
+	require.True(t, remotePaths(cli, "Casks")["Casks/other.rb"], "casks in other directories must not be touched")
+}
+
+func TestPublishRetirementListFailure(t *testing.T) {
+	ctx, cli := newRetirementCtx(t, []config.HomebrewCask{
+		retirementCask("foo", "", ""),
+	})
+	cli.FailToListFiles = true
+
+	require.ErrorContains(t, publishAll(ctx, cli), "could not list files")
+	require.True(t, cli.CreatedFile, "current cask is published before reconciliation runs")
+	require.Empty(t, cli.DeletedFiles)
+}
+
+func TestIsGeneratedCask(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{name: "generated", content: generatedCaskMarker + "\ncask \"foo\" do\nend\n", want: true},
+		{name: "generated with BOM", content: "\ufeff" + generatedCaskMarker + "\ncask \"foo\" do\nend\n", want: true},
+		{name: "generated with trailing spaces", content: generatedCaskMarker + "   \ncask \"foo\" do\nend\n", want: true},
+		{name: "hand maintained", content: "cask \"foo\" do\nend\n", want: false},
+		{name: "marker only in the body", content: "cask \"foo\" do\n  # " + generatedCaskMarker + "\nend\n", want: false},
+		{name: "empty", content: "", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, isGeneratedCask([]byte(tc.content)))
+		})
+	}
+}
+
+func TestGeneratedCaskMarkerMatchesTemplate(t *testing.T) {
+	content, err := doBuildCask(testctx.WrapWithCfg(t.Context(), config.Project{
+		ProjectName: "foo",
+	}), defaultTemplateData)
+	require.NoError(t, err)
+
+	firstLine, _, _ := bytes.Cut([]byte(content), []byte("\n"))
+	require.Equal(t, generatedCaskMarker, string(firstLine),
+		"the template marker must stay in sync with what retirement recognizes")
 }

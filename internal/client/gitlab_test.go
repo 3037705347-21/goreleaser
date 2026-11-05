@@ -2106,3 +2106,127 @@ func TestGitLabUploadReleaseLinkExists(t *testing.T) {
 		})
 	}
 }
+
+func TestGitLabListFiles(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/api/v4/version"):
+			fmt.Fprint(w, `{"version":"18.0.0"}`)
+		case strings.HasSuffix(r.URL.Path, "/repository/branches/main"):
+			fmt.Fprint(w, `{"name":"main"}`)
+		case strings.HasSuffix(r.URL.Path, "/repository/tree") && r.Method == http.MethodGet:
+			fmt.Fprint(w, `[
+				{"id":"a","name":"old.rb","type":"blob","path":"Casks/old.rb"},
+				{"id":"b","name":"manual.rb","type":"blob","path":"Casks/manual.rb"},
+				{"id":"c","name":"sub","type":"tree","path":"Casks/sub"}
+			]`)
+		case strings.Contains(r.URL.Path, "/repository/files/") && r.Method == http.MethodGet:
+			switch {
+			case strings.HasSuffix(r.URL.Path, "Casks/old.rb"):
+				fmt.Fprint(w, `{"file_path":"Casks/old.rb","encoding":"base64","content":"b2xk","ref":"main"}`)
+			case strings.HasSuffix(r.URL.Path, "Casks/manual.rb"):
+				fmt.Fprint(w, `{"file_path":"Casks/manual.rb","encoding":"base64","content":"bWFudWFs","ref":"main"}`)
+			default:
+				t.Error("unhandled file: " + r.URL.Path)
+			}
+		default:
+			t.Error("unhandled request: " + r.Method + " " + r.URL.Path)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	ctx := testctx.WrapWithCfg(t.Context(), config.Project{GitLabURLs: config.GitLabURLs{API: srv.URL}})
+	c, err := newGitLab(ctx, "test-token")
+	require.NoError(t, err)
+
+	entries, err := c.ListFiles(ctx, Repo{Owner: "someone", Name: "something", Branch: "main"}, "Casks")
+	require.NoError(t, err)
+	paths := map[string]string{}
+	for _, entry := range entries {
+		paths[entry.Path] = string(entry.Content)
+	}
+	require.Equal(t, "old", paths["Casks/old.rb"])
+	require.Equal(t, "manual", paths["Casks/manual.rb"])
+	require.NotContains(t, paths, "Casks/sub")
+}
+
+func TestGitLabListFilesMissingDirectory(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/api/v4/version"):
+			fmt.Fprint(w, `{"version":"18.0.0"}`)
+		case strings.HasSuffix(r.URL.Path, "/repository/branches/main"):
+			fmt.Fprint(w, `{"name":"main"}`)
+		case strings.HasSuffix(r.URL.Path, "/repository/tree") && r.Method == http.MethodGet:
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"message":"404 Tree Not Found"}`)
+		default:
+			t.Error("unhandled request: " + r.Method + " " + r.URL.Path)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	ctx := testctx.WrapWithCfg(t.Context(), config.Project{GitLabURLs: config.GitLabURLs{API: srv.URL}})
+	c, err := newGitLab(ctx, "test-token")
+	require.NoError(t, err)
+
+	entries, err := c.ListFiles(ctx, Repo{Owner: "someone", Name: "something", Branch: "main"}, "Casks")
+	require.NoError(t, err)
+	require.Empty(t, entries)
+}
+
+func TestGitLabDeleteFile(t *testing.T) {
+	t.Parallel()
+	var deleted bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/api/v4/version"):
+			fmt.Fprint(w, `{"version":"18.0.0"}`)
+		case strings.HasSuffix(r.URL.Path, "/repository/branches/main"):
+			fmt.Fprint(w, `{"name":"main"}`)
+		case strings.Contains(r.URL.Path, "/repository/files/") && r.Method == http.MethodDelete:
+			deleted = true
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Error("unhandled request: " + r.Method + " " + r.URL.Path)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	ctx := testctx.WrapWithCfg(t.Context(), config.Project{GitLabURLs: config.GitLabURLs{API: srv.URL}})
+	c, err := newGitLab(ctx, "test-token")
+	require.NoError(t, err)
+	repo := Repo{Owner: "someone", Name: "something", Branch: "main"}
+
+	require.NoError(t, c.DeleteFile(ctx, config.CommitAuthor{Name: "user", Email: "u@e.com"}, repo, "Casks/old.rb", "retire"))
+	require.True(t, deleted)
+}
+
+func TestGitLabDeleteFileAlreadyMissing(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/api/v4/version"):
+			fmt.Fprint(w, `{"version":"18.0.0"}`)
+		case strings.HasSuffix(r.URL.Path, "/repository/branches/main"):
+			fmt.Fprint(w, `{"name":"main"}`)
+		case strings.Contains(r.URL.Path, "/repository/files/") && r.Method == http.MethodDelete:
+			// deleting a file that is already gone is not an error, so retries
+			// converge.
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"message":"404 File Not Found"}`)
+		default:
+			t.Error("unhandled request: " + r.Method + " " + r.URL.Path)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	ctx := testctx.WrapWithCfg(t.Context(), config.Project{GitLabURLs: config.GitLabURLs{API: srv.URL}})
+	c, err := newGitLab(ctx, "test-token")
+	require.NoError(t, err)
+	repo := Repo{Owner: "someone", Name: "something", Branch: "main"}
+
+	require.NoError(t, c.DeleteFile(ctx, config.CommitAuthor{}, repo, "Casks/old.rb", "retire"))
+}
