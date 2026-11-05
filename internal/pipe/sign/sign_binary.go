@@ -90,7 +90,7 @@ func (BinaryPipe) Run(ctx *context.Context) error {
 			if len(cfg.IDs) > 0 {
 				filters = append(filters, artifact.ByIDs(cfg.IDs...))
 			}
-			return sign(ctx, config.Sign(cfg), ctx.Artifacts.Filter(artifact.And(filters...)).List())
+			return sign(ctx, config.Sign(cfg), ctx.Artifacts.Filter(artifact.And(filters...)).List(), true)
 		})
 	}
 	return g.Wait()

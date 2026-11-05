@@ -84,7 +84,7 @@ func (DockerPipe) Publish(ctx *context.Context) error {
 
 			filters = append(filters, artifact.ByIDs(cfg.IDs...))
 			images := ctx.Artifacts.Filter(artifact.And(filters...)).List()
-			if err := sign(ctx, cfg, images); err != nil {
+			if err := sign(ctx, cfg, images, false); err != nil {
 				return err
 			}
 			for _, img := range images {

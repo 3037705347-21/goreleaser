@@ -193,11 +193,33 @@ func TestBinarySign(t *testing.T) {
 			},
 		})
 		require.Len(t, sigs, 2)
+		// sha256 of the "foo" content written to bin1 and bin2.
+		const fooDigest = "sha256:2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae"
 		require.Equal(
 			t,
 			[]*artifact.Artifact{
-				{Name: "prefix_amd64_suffix", Path: "prefix_amd64_suffix", Type: 13, Extra: artifact.Extras{"ID": "default"}},
-				{Name: "prefix_arm64_suffix", Path: "prefix_arm64_suffix", Type: 13, Extra: artifact.Extras{"ID": "default"}},
+				{
+					Name: "prefix_amd64_suffix",
+					Path: "prefix_amd64_suffix",
+					Type: 13,
+					Extra: artifact.Extras{
+						"ID":           "default",
+						"SignManaged":  true,
+						"SignDigest":   fooDigest,
+						"SignArtifact": "bin1",
+					},
+				},
+				{
+					Name: "prefix_arm64_suffix",
+					Path: "prefix_arm64_suffix",
+					Type: 13,
+					Extra: artifact.Extras{
+						"ID":           "default",
+						"SignManaged":  true,
+						"SignDigest":   fooDigest,
+						"SignArtifact": "bin2",
+					},
+				},
 			},
 			sigs,
 		)

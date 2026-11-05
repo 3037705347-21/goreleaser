@@ -3,6 +3,8 @@ package sign
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -127,7 +129,7 @@ func (Pipe) Run(ctx *context.Context) error {
 			}
 
 			filters = append(filters, artifact.ByIDs(cfg.IDs...))
-			return sign(ctx, cfg, ctx.Artifacts.Filter(artifact.And(filters...)).List())
+			return sign(ctx, cfg, ctx.Artifacts.Filter(artifact.And(filters...)).List(), true)
 		})
 	}
 	err := g.Wait()
@@ -141,24 +143,253 @@ func (Pipe) Run(ctx *context.Context) error {
 	return err
 }
 
-func sign(ctx *context.Context, cfg config.Sign, artifacts []*artifact.Artifact) error {
+// sign signs the given artifacts.
+//
+// When managed is true the artifacts are local files and their signatures
+// are maintained as a machine-generated roster: on selective rebuilds,
+// signatures are reused when the artifact content did not change and stale
+// machine signatures are pruned. Docker images are signed remotely, so
+// they are not part of the roster.
+func sign(ctx *context.Context, cfg config.Sign, artifacts []*artifact.Artifact, managed bool) error {
 	if len(artifacts) == 0 {
 		log.Warn("no artifacts matching the given filters found")
-		return nil
 	}
+
+	reconcile := managed && ctx.Partial
+
+	// expected holds the final paths of every signature and certificate
+	// this config produces for the current artifacts. Machine-generated
+	// outputs that are not in this set are pruned in partial runs.
+	expected := map[string]struct{}{}
+
 	for _, a := range artifacts {
 		if err := a.Refresh(); err != nil {
 			return err
 		}
-		artifacts, err := signone(ctx, cfg, a)
+
+		var digest, sigPath, certPath string
+		if managed {
+			var err error
+			digest, err = contentDigest(a.Path)
+			if err != nil {
+				return fmt.Errorf("sign failed: %s: %w", a.Name, err)
+			}
+
+			_, sigPath, certPath, err = renderTargets(ctx, cfg, a)
+			if err != nil {
+				return fmt.Errorf("sign failed: %s: %w", a.Name, err)
+			}
+			if sigPath != "" {
+				expected[absPath(sigPath)] = struct{}{}
+			}
+			if certPath != "" {
+				expected[absPath(certPath)] = struct{}{}
+			}
+		}
+
+		// On selective rebuilds, reuse machine signatures generated for
+		// the same artifact content instead of signing again.
+		if reconcile && reusableOutputs(ctx, cfg.ID, a, digest, sigPath, certPath) {
+			log.WithField("artifact", a.Name).Info("reusing signature")
+			continue
+		}
+
+		results, err := signone(ctx, cfg, a, signOptions{
+			managed: managed,
+			digest:  digest,
+			atomic:  reconcile,
+		})
 		if err != nil {
 			return err
 		}
-		for _, artifact := range artifacts {
+
+		if reconcile {
+			// Drop the previous machine outputs at these paths, so the
+			// roster does not accumulate stale records. Manually
+			// provided records are never removed.
+			removeManagedOutputs(ctx, cfg.ID, sigPath, certPath)
+		}
+		for _, artifact := range results {
 			ctx.Artifacts.Add(artifact)
 		}
 	}
+
+	// On selective rebuilds, drop machine signatures that no longer
+	// correspond to any current artifact. Manual signatures are kept.
+	if reconcile {
+		return pruneManagedOutputs(ctx, cfg.ID, expected)
+	}
 	return nil
+}
+
+// renderTargets builds the signing environment and renders the final
+// signature and certificate paths for the given artifact.
+func renderTargets(ctx *context.Context, cfg config.Sign, art *artifact.Artifact) (context.Env, string, string, error) {
+	env := ctx.Env.Copy()
+	env["artifactName"] = art.Name // shouldn't be used
+	env["artifact"] = art.Path
+	env["artifactID"] = art.ID()
+	env["digest"] = artifact.ExtraOr(*art, artifact.ExtraDigest, "")
+
+	tmplEnv, err := templateEnvS(ctx, cfg.Env)
+	if err != nil {
+		return nil, "", "", err
+	}
+	maps.Copy(env, context.ToEnv(tmplEnv))
+
+	sigPath, err := tmplPath(ctx, env, art, cfg.Signature)
+	if err != nil {
+		return nil, "", "", err
+	}
+	env["signature"] = sigPath
+
+	certPath, err := tmplPath(ctx, env, art, cfg.Certificate)
+	if err != nil {
+		return nil, "", "", err
+	}
+	env["certificate"] = certPath
+
+	return env, sigPath, certPath, nil
+}
+
+// contentDigest returns the sha256 digest of the file at path.
+func contentDigest(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return "sha256:" + hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// absPath canonicalizes a possibly slashed, possibly relative path, so it
+// can be compared against artifact paths as stored in the artifact list.
+func absPath(p string) string {
+	ap, err := filepath.Abs(filepath.FromSlash(p))
+	if err != nil {
+		return filepath.Clean(filepath.FromSlash(p))
+	}
+	return filepath.Clean(ap)
+}
+
+// reusableOutputs reports whether every signature and certificate the
+// config produces for art already exists on disk, machine-generated for
+// the same artifact content.
+func reusableOutputs(ctx *context.Context, id string, art *artifact.Artifact, digest, sigPath, certPath string) bool {
+	if sigPath != "" && !reusableOutput(ctx, id, art, digest, sigPath, artifact.Signature) {
+		return false
+	}
+	if certPath != "" && !reusableOutput(ctx, id, art, digest, certPath, artifact.Certificate) {
+		return false
+	}
+	return true
+}
+
+func reusableOutput(ctx *context.Context, id string, art *artifact.Artifact, digest, target string, typ artifact.Type) bool {
+	target = absPath(target)
+	for _, rec := range ctx.Artifacts.Filter(artifact.ByType(typ)).List() {
+		switch {
+		case rec.ID() != id:
+			continue
+		case !artifact.ExtraOr(*rec, artifact.ExtraSignManaged, false):
+			continue
+		case artifact.ExtraOr(*rec, artifact.ExtraSignArtifact, "") != art.Path:
+			continue
+		case artifact.ExtraOr(*rec, artifact.ExtraSignDigest, "") != digest:
+			continue
+		case absPath(rec.Path) != target:
+			continue
+		}
+		if _, err := os.Stat(rec.Path); err != nil {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// removeManagedOutputs drops machine-generated signature and certificate
+// records at the given paths. Manually provided records are left alone.
+func removeManagedOutputs(ctx *context.Context, id string, paths ...string) {
+	targets := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		if p != "" {
+			targets[absPath(p)] = struct{}{}
+		}
+	}
+	_ = ctx.Artifacts.Remove(func(a *artifact.Artifact) bool {
+		if a.Type != artifact.Signature && a.Type != artifact.Certificate {
+			return false
+		}
+		if a.ID() != id || !artifact.ExtraOr(*a, artifact.ExtraSignManaged, false) {
+			return false
+		}
+		_, ok := targets[absPath(a.Path)]
+		return ok
+	})
+}
+
+// pruneManagedOutputs removes machine-generated signature and certificate
+// records whose paths are not in expected, and deletes the corresponding
+// files. Manually provided signatures are preserved.
+func pruneManagedOutputs(ctx *context.Context, id string, expected map[string]struct{}) error {
+	var stale []*artifact.Artifact
+	for _, rec := range ctx.Artifacts.Filter(artifact.Or(
+		artifact.ByType(artifact.Signature),
+		artifact.ByType(artifact.Certificate),
+	)).List() {
+		if rec.ID() != id {
+			continue
+		}
+		if !artifact.ExtraOr(*rec, artifact.ExtraSignManaged, false) {
+			continue
+		}
+		if _, ok := expected[absPath(rec.Path)]; ok {
+			continue
+		}
+		stale = append(stale, rec)
+	}
+
+	for _, rec := range stale {
+		logger := log.WithField("name", rec.Name).WithField("type", rec.Type.String())
+		if err := os.Remove(rec.Path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		logger.Info("removing stale machine signature")
+		_ = ctx.Artifacts.Remove(func(a *artifact.Artifact) bool { return a == rec })
+	}
+	return nil
+}
+
+// tempOutput returns a temporary path in the same directory as target, so
+// the signer output can later be atomically renamed onto target. Any
+// leftover from an interrupted previous run is truncated, so reruns
+// converge. The file is removed again: the signer creates it, with its
+// usual permissions. A failed or interrupted signing therefore never
+// touches the previous output at target.
+func tempOutput(target string) (string, error) {
+	tmp := target + ".goreleaser-tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		return "", err
+	}
+	if err := os.Remove(tmp); err != nil {
+		return "", err
+	}
+	return tmp, nil
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func relativeToDist(dist, f string) (string, error) {
@@ -184,31 +415,47 @@ func tmplPath(ctx *context.Context, env map[string]string, a *artifact.Artifact,
 	return relativeToDist(ctx.Config.Dist, result)
 }
 
-func signone(ctx *context.Context, cfg config.Sign, art *artifact.Artifact) ([]*artifact.Artifact, error) {
-	env := ctx.Env.Copy()
-	env["artifactName"] = art.Name // shouldn't be used
-	env["artifact"] = art.Path
-	env["artifactID"] = art.ID()
-	env["digest"] = artifact.ExtraOr(*art, artifact.ExtraDigest, "")
+type signOptions struct {
+	// managed records the produced signatures and certificates as
+	// machine-generated outputs tied to the signed artifact content.
+	managed bool
+	// digest is the sha256 content digest of the signed artifact.
+	digest string
+	// atomic makes the signer write to temporary files that are moved
+	// into place only on success, so a failed or interrupted signing
+	// keeps the previous signatures and certificates intact.
+	atomic bool
+}
 
-	tmplEnv, err := templateEnvS(ctx, cfg.Env)
+func signone(ctx *context.Context, cfg config.Sign, art *artifact.Artifact, opts signOptions) ([]*artifact.Artifact, error) {
+	env, sigPath, certPath, err := renderTargets(ctx, cfg, art)
 	if err != nil {
 		return nil, fmt.Errorf("sign failed: %s: %w", art.Name, err)
 	}
+	name, cert := sigPath, certPath
 
-	maps.Copy(env, context.ToEnv(tmplEnv))
-
-	name, err := tmplPath(ctx, env, art, cfg.Signature)
-	if err != nil {
-		return nil, fmt.Errorf("sign failed: %s: %w", art.Name, err)
+	// In atomic mode the signer writes to temporary files in the same
+	// directory as the final outputs; they are renamed into place only
+	// after the signer succeeds.
+	var sigTmp, certTmp string
+	if opts.atomic {
+		if sigPath != "" {
+			sigTmp, err = tempOutput(sigPath)
+			if err != nil {
+				return nil, fmt.Errorf("sign failed: %s: %w", art.Name, err)
+			}
+			env["signature"] = sigTmp
+			defer os.Remove(sigTmp)
+		}
+		if certPath != "" {
+			certTmp, err = tempOutput(certPath)
+			if err != nil {
+				return nil, fmt.Errorf("sign failed: %s: %w", art.Name, err)
+			}
+			env["certificate"] = certTmp
+			defer os.Remove(certTmp)
+		}
 	}
-	env["signature"] = name
-
-	cert, err := tmplPath(ctx, env, art, cfg.Certificate)
-	if err != nil {
-		return nil, fmt.Errorf("sign failed: %s: %w", art.Name, err)
-	}
-	env["certificate"] = cert
 
 	//nolint:prealloc
 	var args []string
@@ -288,6 +535,12 @@ func signone(ctx *context.Context, cfg config.Sign, art *artifact.Artifact) ([]*
 		return nil, stdoutErr
 	}
 
+	// restore the final output paths before re-rendering names.
+	if opts.atomic {
+		env["signature"] = sigPath
+		env["certificate"] = certPath
+	}
+
 	var result []*artifact.Artifact
 
 	// re-execute template results, using artifact desc as artifact so they eval to the actual needed file desc.
@@ -301,27 +554,55 @@ func signone(ctx *context.Context, cfg config.Sign, art *artifact.Artifact) ([]*
 		return nil, fmt.Errorf("sign failed: %s: %w", art.Name, err)
 	}
 
+	managedExtra := func() map[string]any {
+		extra := map[string]any{
+			artifact.ExtraID: cfg.ID,
+		}
+		if opts.managed {
+			extra[artifact.ExtraSignManaged] = true
+			extra[artifact.ExtraSignDigest] = opts.digest
+			extra[artifact.ExtraSignArtifact] = art.Path
+		}
+		return extra
+	}
+
 	if cfg.Signature != "" {
-		checkWritten(log, env["signature"])
+		if opts.atomic {
+			if fileExists(sigTmp) {
+				if err := os.Rename(sigTmp, sigPath); err != nil {
+					return nil, fmt.Errorf("sign failed: %s: %w", art.Name, err)
+				}
+			} else {
+				checkWritten(log, sigPath)
+			}
+		} else {
+			checkWritten(log, sigPath)
+		}
 		result = append(result, &artifact.Artifact{
-			Type: artifact.Signature,
-			Name: name,
-			Path: env["signature"],
-			Extra: map[string]any{
-				artifact.ExtraID: cfg.ID,
-			},
+			Type:  artifact.Signature,
+			Name:  name,
+			Path:  sigPath,
+			Extra: managedExtra(),
 		})
 	}
 
-	if cert != "" {
-		checkWritten(log, env["certificate"])
+	if certPath != "" {
+		if opts.atomic {
+			if fileExists(certTmp) {
+				if err := os.Rename(certTmp, certPath); err != nil {
+					return nil, fmt.Errorf("sign failed: %s: %w", art.Name, err)
+				}
+			} else {
+				checkWritten(log, certPath)
+			}
+		} else {
+			checkWritten(log, certPath)
+		}
 		result = append(result, &artifact.Artifact{
-			Type: artifact.Certificate,
-			Name: cert,
-			Path: env["certificate"],
-			Extra: map[string]any{
-				artifact.ExtraID: cfg.ID,
-			},
+			Type:  artifact.Certificate,
+			Name:  cert,
+			Path:  certPath,
+			Extra: managedExtra(),
 		})
 	}
 
