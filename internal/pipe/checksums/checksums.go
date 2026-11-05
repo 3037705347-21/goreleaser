@@ -15,6 +15,7 @@ import (
 	"github.com/caarlos0/log"
 	"github.com/goreleaser/goreleaser/v2/internal/artifact"
 	"github.com/goreleaser/goreleaser/v2/internal/extrafiles"
+	"github.com/goreleaser/goreleaser/v2/internal/gio"
 	"github.com/goreleaser/goreleaser/v2/internal/semerrgroup"
 	"github.com/goreleaser/goreleaser/v2/internal/tmpl"
 	"github.com/goreleaser/goreleaser/v2/pkg/context"
@@ -23,6 +24,14 @@ import (
 var (
 	errNoArtifacts = errors.New("there are no artifacts to checksum")
 	lock           sync.Mutex
+)
+
+// Markers delimiting the checksum lines managed by GoReleaser when
+// Checksum.Preserve is enabled. Every other line in the file, such as
+// comments and manually added checksums, is left untouched.
+const (
+	managedRegionBegin = "# goreleaser:checksums:begin"
+	managedRegionEnd   = "# goreleaser:checksums:end"
 )
 
 // Pipe for checksums.
@@ -123,7 +132,7 @@ func refreshOne(ctx *context.Context, art artifact.Artifact, path string) error 
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(check), 0o644)
+	return gio.WriteFile(path, []byte(check), 0o644)
 }
 
 func refreshAll(ctx *context.Context, filepath string) error {
@@ -153,16 +162,6 @@ func refreshAll(ctx *context.Context, filepath string) error {
 		return err
 	}
 
-	file, err := os.OpenFile(
-		filepath,
-		os.O_APPEND|os.O_WRONLY|os.O_CREATE|os.O_TRUNC,
-		0o644,
-	)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
 	// sort to ensure the signature is deterministic downstream
 	slices.SortFunc(sumLines, func(a, b string) int {
 		// sort by the filename of a checksum line ("{checksum}  {filename}\n")
@@ -176,8 +175,101 @@ func refreshAll(ctx *context.Context, filepath string) error {
 		}
 		return cmp.Compare(nameA, nameB)
 	})
-	_, err = file.WriteString(strings.Join(sumLines, ""))
-	return err
+
+	content := strings.Join(sumLines, "")
+	if ctx.Config.Checksum.Preserve {
+		content, err = reconcileManagedRegion(filepath, content)
+		if err != nil {
+			return err
+		}
+	}
+	return gio.WriteFile(filepath, []byte(content), 0o644)
+}
+
+// reconcileManagedRegion regenerates the managed checksum region of the
+// file at path, leaving every other line (comments and manually added
+// checksums) byte-for-byte untouched.
+//
+// generated is the content of the managed region: checksum lines sorted
+// and terminated by newlines. Lines for artifacts that no longer exist
+// disappear because the region is fully derived from generated.
+func reconcileManagedRegion(path string, generated string) (string, error) {
+	current, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+
+	lines := strings.SplitAfter(string(current), "\n")
+	// SplitAfter appends an empty final element when the content ends
+	// with '\n'; drop it so marker lookup stays straightforward.
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+
+	begin := -1
+	end := -1
+	for i, line := range lines {
+		switch strings.TrimSuffix(line, "\n") {
+		case managedRegionBegin:
+			if begin != -1 {
+				return "", fmt.Errorf("checksums file %s contains multiple %q markers", path, managedRegionBegin)
+			}
+			begin = i
+		case managedRegionEnd:
+			if end != -1 {
+				return "", fmt.Errorf("checksums file %s contains multiple %q markers", path, managedRegionEnd)
+			}
+			end = i
+		}
+	}
+
+	block := strings.Join([]string{
+		managedRegionBegin + "\n",
+		generated,
+		managedRegionEnd + "\n",
+	}, "")
+
+	switch {
+	case begin == -1 && end == -1:
+		// Plain, unmarked file written before preserve was enabled.
+		// Adopt the checksum lines of current artifacts as the managed
+		// region and keep everything else as custom content.
+		return adoptUnmarkedFile(lines, block, generated), nil
+	case begin == -1:
+		return "", fmt.Errorf("checksums file %s contains %q without %q", path, managedRegionEnd, managedRegionBegin)
+	case end == -1:
+		return "", fmt.Errorf("checksums file %s contains %q without %q", path, managedRegionBegin, managedRegionEnd)
+	case end < begin:
+		return "", fmt.Errorf("checksums file %s has %q before %q", path, managedRegionEnd, managedRegionBegin)
+	}
+
+	prefix := strings.Join(lines[:begin], "")
+	suffix := strings.Join(lines[end+1:], "")
+	return prefix + block + suffix, nil
+}
+
+// adoptUnmarkedFile wraps generated in the managed region markers and
+// preserves all lines that are not checksum lines of current artifacts,
+// in their original order.
+func adoptUnmarkedFile(lines []string, block, generated string) string {
+	managedNames := make(map[string]struct{})
+	for _, line := range strings.SplitAfter(generated, "\n") {
+		if _, name, ok := strings.Cut(strings.TrimSuffix(line, "\n"), "  "); ok && name != "" {
+			managedNames[name] = struct{}{}
+		}
+	}
+
+	var custom strings.Builder
+	for _, line := range lines {
+		if _, name, ok := strings.Cut(strings.TrimSuffix(line, "\n"), "  "); ok {
+			if _, managed := managedNames[name]; managed {
+				// replaced by the freshly generated region
+				continue
+			}
+		}
+		custom.WriteString(line)
+	}
+	return block + custom.String()
 }
 
 func buildArtifactList(ctx *context.Context) ([]*artifact.Artifact, error) {

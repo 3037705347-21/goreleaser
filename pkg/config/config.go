@@ -1214,6 +1214,13 @@ type Checksum struct {
 	IDs          []string    `yaml:"ids,omitempty" json:"ids,omitempty"`
 	Disable      bool        `yaml:"disable,omitempty" json:"disable,omitempty"`
 	ExtraFiles   []ExtraFile `yaml:"extra_files,omitempty" json:"extra_files,omitempty"`
+
+	// Preserve keeps lines manually added to the checksums file, such as
+	// comments and checksums of external artifacts.
+	// When enabled, only the checksum lines generated for the current
+	// artifacts, delimited by marker comments, are replaced on regeneration.
+	// It has no effect when split is enabled.
+	Preserve bool `yaml:"preserve,omitempty" json:"preserve,omitempty"`
 }
 
 // Retry config for operations that support retries.

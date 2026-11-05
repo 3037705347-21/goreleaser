@@ -918,6 +918,9 @@
 							"$ref": "#/$defs/ExtraFile"
 						},
 						"type": "array"
+					},
+					"preserve": {
+						"type": "boolean"
 					}
 				},
 				"additionalProperties": false,

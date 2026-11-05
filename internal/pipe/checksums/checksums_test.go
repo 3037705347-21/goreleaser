@@ -1,11 +1,13 @@
 package checksums
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/goreleaser/goreleaser/v2/internal/artifact"
 	"github.com/goreleaser/goreleaser/v2/internal/testctx"
@@ -517,6 +519,358 @@ func TestSkip(t *testing.T) {
 	t.Run("dont skip", func(t *testing.T) {
 		require.False(t, Pipe{}.Skip(testctx.Wrap(t.Context())))
 	})
+}
+
+func newPreserveProject(folder string) config.Project {
+	return config.Project{
+		Dist:        folder,
+		ProjectName: "proj",
+		Checksum: config.Checksum{
+			NameTemplate: "checksums.txt",
+			Algorithm:    "sha256",
+			Preserve:     true,
+		},
+	}
+}
+
+// splitManagedRegion splits a checksums file content into the bytes
+// before the managed region, the region body and the bytes after it.
+func splitManagedRegion(t *testing.T, content string) (string, string, string) {
+	t.Helper()
+	beginLine := managedRegionBegin + "\n"
+	endLine := managedRegionEnd + "\n"
+
+	begin := strings.Index(content, beginLine)
+	require.NotEqual(t, -1, begin, "missing begin marker in:\n%s", content)
+	bodyStart := begin + len(beginLine)
+
+	endRel := strings.Index(content[bodyStart:], endLine)
+	require.NotEqual(t, -1, endRel, "missing end marker in:\n%s", content)
+	bodyEnd := bodyStart + endRel
+
+	return content[:begin], content[bodyStart:bodyEnd], content[bodyEnd+len(endLine):]
+}
+
+func TestPipeWithoutPreserveHasNoMarkers(t *testing.T) {
+	folder := t.TempDir()
+	file := filepath.Join(folder, "binary")
+	require.NoError(t, os.WriteFile(file, []byte("some string"), 0o644))
+	ctx := testctx.WrapWithCfg(t.Context(), config.Project{
+		Dist:        folder,
+		ProjectName: "proj",
+		Checksum: config.Checksum{
+			NameTemplate: "checksums.txt",
+			Algorithm:    "sha256",
+		},
+	})
+	ctx.Artifacts.Add(&artifact.Artifact{
+		Name: "binary",
+		Path: file,
+		Type: artifact.UploadableBinary,
+	})
+
+	require.NoError(t, Pipe{}.Run(ctx))
+
+	bts, err := os.ReadFile(filepath.Join(folder, "checksums.txt"))
+	require.NoError(t, err)
+	require.NotContains(t, string(bts), managedRegionBegin)
+	require.NotContains(t, string(bts), managedRegionEnd)
+	require.Equal(t, "61d034473102d7dac305902770471fd50f4c5b26f6831a56dd90b5184b3c30fc  binary\n", string(bts))
+}
+
+func TestPipePreserveCreatesManagedRegion(t *testing.T) {
+	folder := t.TempDir()
+	file := filepath.Join(folder, "binary")
+	require.NoError(t, os.WriteFile(file, []byte("some string"), 0o644))
+	ctx := testctx.WrapWithCfg(t.Context(), newPreserveProject(folder))
+	ctx.Artifacts.Add(&artifact.Artifact{
+		Name: "binary",
+		Path: file,
+		Type: artifact.UploadableBinary,
+	})
+
+	require.NoError(t, Pipe{}.Run(ctx))
+
+	bts, err := os.ReadFile(filepath.Join(folder, "checksums.txt"))
+	require.NoError(t, err)
+	require.Equal(t, strings.Join([]string{
+		managedRegionBegin,
+		"61d034473102d7dac305902770471fd50f4c5b26f6831a56dd90b5184b3c30fc  binary",
+		managedRegionEnd,
+		"",
+	}, "\n"), string(bts))
+}
+
+func TestPipePreserveIsIdempotent(t *testing.T) {
+	folder := t.TempDir()
+	file := filepath.Join(folder, "binary")
+	require.NoError(t, os.WriteFile(file, []byte("some string"), 0o644))
+	ctx := testctx.WrapWithCfg(t.Context(), newPreserveProject(folder))
+	ctx.Artifacts.Add(&artifact.Artifact{
+		Name: "binary",
+		Path: file,
+		Type: artifact.UploadableBinary,
+	})
+
+	require.NoError(t, Pipe{}.Run(ctx))
+	path := filepath.Join(folder, "checksums.txt")
+
+	first, err := os.ReadFile(path)
+	require.NoError(t, err)
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+
+	time.Sleep(10 * time.Millisecond)
+
+	checks := ctx.Artifacts.Filter(artifact.ByType(artifact.Checksum)).List()
+	require.Len(t, checks, 1)
+	require.NoError(t, checks[0].Refresh())
+
+	second, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.True(t, bytes.Equal(first, second), "rerun changed the file:\n%s\n%s", first, second)
+
+	info2, err := os.Stat(path)
+	require.NoError(t, err)
+	require.True(t, info2.ModTime().Equal(info.ModTime()), "rerun rewrote an unchanged file")
+}
+
+func TestPipePreserveKeepsManualContent(t *testing.T) {
+	folder := t.TempDir()
+	file := filepath.Join(folder, "binary")
+	require.NoError(t, os.WriteFile(file, []byte("some string"), 0o644))
+	ctx := testctx.WrapWithCfg(t.Context(), newPreserveProject(folder))
+	ctx.Artifacts.Add(&artifact.Artifact{
+		Name: "binary",
+		Path: file,
+		Type: artifact.UploadableBinary,
+	})
+
+	require.NoError(t, Pipe{}.Run(ctx))
+	path := filepath.Join(folder, "checksums.txt")
+	first, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	// Simulate a user adding a header, an approval record and a checksum
+	// line for an external artifact.
+	prefix := "# build: 2026-11-05\n"
+	suffix := "\n# release approved by alice\n# approval id: 42\ndeadbeef  external-blob.tar.gz\n"
+	edited := make([]byte, 0, len(prefix)+len(first)+len(suffix))
+	edited = append(edited, prefix...)
+	edited = append(edited, first...)
+	edited = append(edited, suffix...)
+	require.NoError(t, os.WriteFile(path, edited, 0o644))
+
+	// The artifact changes: its checksum must be refreshed inside the
+	// region, while manual content stays byte-for-byte the same.
+	require.NoError(t, os.WriteFile(file, []byte("some other string"), 0o644))
+	checks := ctx.Artifacts.Filter(artifact.ByType(artifact.Checksum)).List()
+	require.Len(t, checks, 1)
+	require.NoError(t, checks[0].Refresh())
+
+	bts, err := os.ReadFile(path)
+	require.NoError(t, err)
+	gotPrefix, gotBody, gotSuffix := splitManagedRegion(t, string(bts))
+	require.Equal(t, prefix, gotPrefix)
+	require.Equal(t, suffix, gotSuffix)
+
+	bodyLines := strings.Split(strings.Trim(gotBody, "\n"), "\n")
+	require.Equal(t, []string{"binary"}, func() []string {
+		names := make([]string, 0, len(bodyLines))
+		for _, line := range bodyLines {
+			_, name, ok := strings.Cut(line, "  ")
+			require.True(t, ok)
+			names = append(names, name)
+		}
+		return names
+	}())
+	require.NotContains(t, gotBody, "61d034473102d7dac305902770471fd50f4c5b26f6831a56dd90b5184b3c30fc")
+	require.Contains(t, gotBody, "  binary")
+	require.Contains(t, gotSuffix, "# release approved by alice")
+	require.Contains(t, gotSuffix, "deadbeef  external-blob.tar.gz")
+
+	// Another refresh must be a no-op.
+	refreshed := string(bts)
+	require.NoError(t, checks[0].Refresh())
+	bts2, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, refreshed, string(bts2))
+}
+
+func TestPipePreserveReconcilesArtifactSet(t *testing.T) {
+	folder := t.TempDir()
+
+	binary := filepath.Join(folder, "binary")
+	archive := filepath.Join(folder, "archive.tar.gz")
+	extra := filepath.Join(folder, "extra.bin")
+	require.NoError(t, os.WriteFile(binary, []byte("some string"), 0o644))
+	require.NoError(t, os.WriteFile(archive, []byte("some string"), 0o644))
+
+	ctx := testctx.WrapWithCfg(t.Context(), newPreserveProject(folder))
+	ctx.Artifacts.Add(&artifact.Artifact{Name: "binary", Path: binary, Type: artifact.UploadableBinary})
+	ctx.Artifacts.Add(&artifact.Artifact{Name: "archive.tar.gz", Path: archive, Type: artifact.UploadableArchive})
+	require.NoError(t, Pipe{}.Run(ctx))
+
+	// User appends an external checksum after the first run.
+	path := filepath.Join(folder, "checksums.txt")
+	suffix := "# external\ndeadbeef  external-blob.tar.gz\n"
+	require.NoError(t, os.WriteFile(path, append(mustReadFile(t, path), []byte(suffix)...), 0o644))
+
+	// Second run: archive disappears, extra appears.
+	require.NoError(t, os.WriteFile(extra, []byte("extra content"), 0o644))
+	ctx2 := testctx.WrapWithCfg(t.Context(), newPreserveProject(folder))
+	ctx2.Artifacts.Add(&artifact.Artifact{Name: "binary", Path: binary, Type: artifact.UploadableBinary})
+	ctx2.Artifacts.Add(&artifact.Artifact{Name: "extra.bin", Path: extra, Type: artifact.UploadableBinary})
+	require.NoError(t, Pipe{}.Run(ctx2))
+
+	bts := mustReadFile(t, path)
+	_, body, gotSuffix := splitManagedRegion(t, string(bts))
+	require.Equal(t, suffix, gotSuffix)
+	require.Contains(t, body, "  binary")
+	require.Contains(t, body, "  extra.bin")
+	require.NotContains(t, body, "archive.tar.gz", "lines for disappeared artifacts must be removed")
+	// region is sorted by filename
+	require.Less(t, strings.Index(body, "  binary"), strings.Index(body, "  extra.bin"))
+	require.Contains(t, gotSuffix, "deadbeef  external-blob.tar.gz")
+
+	// Rerunning with the same input is stable.
+	require.NoError(t, Pipe{}.Run(ctx2))
+	bts2 := mustReadFile(t, path)
+	require.True(t, bytes.Equal(bts, bts2))
+}
+
+func TestPipePreserveAdoptsPlainFile(t *testing.T) {
+	const sum = "61d034473102d7dac305902770471fd50f4c5b26f6831a56dd90b5184b3c30fc"
+
+	t.Run("plain file with manual lines", func(t *testing.T) {
+		folder := t.TempDir()
+		file := filepath.Join(folder, "binary")
+		require.NoError(t, os.WriteFile(file, []byte("some string"), 0o644))
+
+		// Old-style file, written before preserve was enabled: tool
+		// lines mixed with comments and external/stale checksum lines.
+		path := filepath.Join(folder, "checksums.txt")
+		require.NoError(t, os.WriteFile(path, []byte(strings.Join([]string{
+			sum + "  binary",
+			"# manually tracked external product",
+			"0000000000000000000000000000000000000000000000000000000000000000  external-blob.tar.gz",
+			"1111111111111111111111111111111111111111111111111111111111111111  removed-binary",
+			"",
+		}, "\n")), 0o644))
+
+		ctx := testctx.WrapWithCfg(t.Context(), newPreserveProject(folder))
+		ctx.Artifacts.Add(&artifact.Artifact{Name: "binary", Path: file, Type: artifact.UploadableBinary})
+		require.NoError(t, Pipe{}.Run(ctx))
+
+		bts := mustReadFile(t, path)
+		prefix, body, suffix := splitManagedRegion(t, string(bts))
+		require.Empty(t, prefix)
+		require.Equal(t, sum+"  binary\n", body)
+		require.Equal(t, strings.Join([]string{
+			"# manually tracked external product",
+			"0000000000000000000000000000000000000000000000000000000000000000  external-blob.tar.gz",
+			"1111111111111111111111111111111111111111111111111111111111111111  removed-binary",
+			"",
+		}, "\n"), suffix)
+	})
+
+	t.Run("plain file with tool lines only", func(t *testing.T) {
+		folder := t.TempDir()
+		file := filepath.Join(folder, "binary")
+		require.NoError(t, os.WriteFile(file, []byte("some string"), 0o644))
+
+		path := filepath.Join(folder, "checksums.txt")
+		require.NoError(t, os.WriteFile(path, []byte(sum+"  binary\n"), 0o644))
+
+		ctx := testctx.WrapWithCfg(t.Context(), newPreserveProject(folder))
+		ctx.Artifacts.Add(&artifact.Artifact{Name: "binary", Path: file, Type: artifact.UploadableBinary})
+		require.NoError(t, Pipe{}.Run(ctx))
+
+		require.Equal(t, strings.Join([]string{
+			managedRegionBegin,
+			sum + "  binary",
+			managedRegionEnd,
+			"",
+		}, "\n"), string(mustReadFile(t, path)))
+	})
+}
+
+func TestReconcileManagedRegionMalformed(t *testing.T) {
+	generated := "61d034473102d7dac305902770471fd50f4c5b26f6831a56dd90b5184b3c30fc  binary\n"
+
+	for name, content := range map[string]string{
+		"begin without end": strings.Join([]string{
+			managedRegionBegin,
+			generated,
+			"# manual",
+		}, "\n"),
+		"end without begin": strings.Join([]string{
+			generated,
+			managedRegionEnd,
+		}, "\n"),
+		"multiple begin": strings.Join([]string{
+			managedRegionBegin,
+			generated,
+			managedRegionEnd,
+			managedRegionBegin,
+		}, "\n"),
+		"end before begin": strings.Join([]string{
+			managedRegionEnd,
+			managedRegionBegin,
+			generated,
+			managedRegionEnd,
+		}, "\n"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			folder := t.TempDir()
+			path := filepath.Join(folder, "checksums.txt")
+			require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+			_, err := reconcileManagedRegion(path, generated)
+			require.Error(t, err)
+
+			// A failed reconcile must not touch the file.
+			bts, rerr := os.ReadFile(path)
+			require.NoError(t, rerr)
+			require.Equal(t, content, string(bts))
+		})
+	}
+}
+
+func TestReconcileManagedRegionMissingFile(t *testing.T) {
+	generated := "abc  binary\n"
+	got, err := reconcileManagedRegion(filepath.Join(t.TempDir(), "checksums.txt"), generated)
+	require.NoError(t, err)
+	require.Equal(t, managedRegionBegin+"\n"+generated+managedRegionEnd+"\n", got)
+}
+
+func TestPipePreserveSplitIsIgnored(t *testing.T) {
+	folder := t.TempDir()
+	file := filepath.Join(folder, "binary")
+	require.NoError(t, os.WriteFile(file, []byte("some string"), 0o644))
+	ctx := testctx.WrapWithCfg(t.Context(), config.Project{
+		Dist: folder,
+		Checksum: config.Checksum{
+			Split:    true,
+			Preserve: true,
+		},
+	})
+	ctx.Artifacts.Add(&artifact.Artifact{Name: "binary", Path: file, Type: artifact.UploadableBinary})
+	require.NoError(t, Pipe{}.Default(ctx))
+	require.NoError(t, Pipe{}.Run(ctx))
+
+	checks := ctx.Artifacts.Filter(artifact.ByType(artifact.Checksum)).List()
+	require.Len(t, checks, 1)
+	bts, err := os.ReadFile(checks[0].Path)
+	require.NoError(t, err)
+	require.Equal(t, "61d034473102d7dac305902770471fd50f4c5b26f6831a56dd90b5184b3c30fc", string(bts))
+}
+
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	bts, err := os.ReadFile(path)
+	require.NoError(t, err)
+	return bts
 }
 
 func TestChecksumExcludesSignaturesAndCertificates(t *testing.T) {
