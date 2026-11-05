@@ -7,9 +7,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/goreleaser/goreleaser/v2/internal/artifact"
+	"github.com/goreleaser/goreleaser/v2/internal/resume"
 	"github.com/goreleaser/goreleaser/v2/internal/semerrgroup"
 	"github.com/goreleaser/goreleaser/v2/internal/skips"
 	"github.com/goreleaser/goreleaser/v2/internal/testctx"
@@ -883,4 +885,95 @@ func TestRunHookFailWithLogs(t *testing.T) {
 	err := Pipe{}.Run(ctx)
 	require.ErrorContains(t, err, "pre hook failed")
 	require.Empty(t, ctx.Artifacts.List())
+}
+
+func TestResumeSkipsCompletedTarget(t *testing.T) {
+	t.Parallel()
+	folder := t.TempDir()
+	ctx := testctx.WrapWithCfg(t.Context(), config.Project{
+		Dist: folder,
+		Builds: []config.Build{
+			{
+				ID:      "testing",
+				Builder: "fake",
+				Binary:  "testing",
+				Targets: []string{"linux_amd64", "linux_arm64"},
+			},
+		},
+	}, testctx.WithCurrentTag("2.4.5"))
+	ctx.Resume = true
+	ctx.ResumeClaimed = &sync.Map{}
+
+	// linux_amd64 was completed before the interruption, arm64 was not.
+	donePath := filepath.Join(folder, "testing_linux_amd64", "testing")
+	require.NoError(t, os.MkdirAll(filepath.Dir(donePath), 0o755))
+	require.NoError(t, os.WriteFile(donePath, []byte("adopted"), 0o755))
+	ctx.Artifacts.Add(&artifact.Artifact{
+		Name:   "testing",
+		Path:   donePath,
+		Type:   artifact.Binary,
+		Target: "linux_amd64",
+		Extra: map[string]any{
+			artifact.ExtraID:      "testing",
+			artifact.ExtraAdopted: true,
+		},
+	})
+
+	require.NoError(t, Pipe{}.Run(ctx))
+
+	// the completed target is left untouched (the fake builder writes "foo")
+	bts, err := os.ReadFile(donePath)
+	require.NoError(t, err)
+	require.Equal(t, "adopted", string(bts))
+
+	// the missing target is rebuilt
+	missingPath := filepath.Join(folder, "testing_linux_arm64", "testing")
+	bts, err = os.ReadFile(missingPath)
+	require.NoError(t, err)
+	require.Equal(t, "foo", string(bts))
+
+	// exactly two artifacts, both claimed (no leftover adopted markers)
+	list := ctx.Artifacts.List()
+	require.Len(t, list, 2)
+	for _, a := range list {
+		require.False(t, resume.Adopted(ctx, a))
+	}
+
+	// a checkpoint manifest was written
+	require.FileExists(t, filepath.Join(folder, "artifacts.json"))
+}
+
+func TestResumeRebuildsTargetWithMissingFile(t *testing.T) {
+	t.Parallel()
+	folder := t.TempDir()
+	ctx := testctx.WrapWithCfg(t.Context(), config.Project{
+		Dist: folder,
+		Builds: []config.Build{
+			{
+				ID:      "testing",
+				Builder: "fake",
+				Binary:  "testing",
+				Targets: []string{"linux_amd64"},
+			},
+		},
+	}, testctx.WithCurrentTag("2.4.5"))
+	ctx.Resume = true
+	ctx.ResumeClaimed = &sync.Map{}
+
+	// artifact is marked as adopted, but the file was lost: must rebuild
+	ctx.Artifacts.Add(&artifact.Artifact{
+		Name:   "testing",
+		Path:   filepath.Join(folder, "testing_linux_amd64", "testing"),
+		Type:   artifact.Binary,
+		Target: "linux_amd64",
+		Extra: map[string]any{
+			artifact.ExtraID:      "testing",
+			artifact.ExtraAdopted: true,
+		},
+	})
+
+	require.NoError(t, Pipe{}.Run(ctx))
+	bts, err := os.ReadFile(filepath.Join(folder, "testing_linux_amd64", "testing"))
+	require.NoError(t, err)
+	require.Equal(t, "foo", string(bts))
 }

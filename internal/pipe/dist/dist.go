@@ -1,5 +1,7 @@
-// Package dist provides checks to make sure the dist directory is always
-// empty.
+// Package dist makes sure the distribution directory exists and is ready
+// to be used. It is created on fresh runs, removed entirely with
+// --clean, and reconciled in place when resuming a previous run of the
+// same version (see internal/resume).
 package dist
 
 import (
@@ -7,6 +9,7 @@ import (
 	"os"
 
 	"github.com/caarlos0/log"
+	"github.com/goreleaser/goreleaser/v2/internal/resume"
 	"github.com/goreleaser/goreleaser/v2/pkg/context"
 )
 
@@ -47,6 +50,13 @@ func (Pipe) Run(ctx *context.Context) error {
 	}
 	if len(files) != 0 {
 		log.Debugf("there are %d files on %s", len(files), ctx.Config.Dist)
+		engaged, err := resume.Detect(ctx)
+		if err != nil {
+			return err
+		}
+		if engaged {
+			return mkdir(ctx)
+		}
 		return fmt.Errorf(
 			"%s is not empty, remove it before running goreleaser or use the --clean flag",
 			ctx.Config.Dist,

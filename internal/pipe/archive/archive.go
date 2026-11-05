@@ -18,6 +18,7 @@ import (
 	"github.com/goreleaser/goreleaser/v2/internal/artifact"
 	"github.com/goreleaser/goreleaser/v2/internal/deprecate"
 	"github.com/goreleaser/goreleaser/v2/internal/ids"
+	"github.com/goreleaser/goreleaser/v2/internal/resume"
 	"github.com/goreleaser/goreleaser/v2/internal/semerrgroup"
 	"github.com/goreleaser/goreleaser/v2/internal/skips"
 	"github.com/goreleaser/goreleaser/v2/internal/tmpl"
@@ -169,6 +170,47 @@ func createMeta(ctx *context.Context, arch config.Archive, format string) error 
 	return create(ctx, arch, nil, format)
 }
 
+// adoptedBinary returns an uploadable binary artifact adopted from a
+// previous run that matches what the binary archive format would create.
+func adoptedBinary(ctx *context.Context, id, name, path string) *artifact.Artifact {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil
+	}
+	for _, a := range ctx.Artifacts.Snapshot() {
+		if a.Type != artifact.UploadableBinary || !resume.Adopted(ctx, a) || a.Name != name || a.ID() != id {
+			continue
+		}
+		ap, err := filepath.Abs(a.Path)
+		if err == nil && ap == abs {
+			return a
+		}
+	}
+	return nil
+}
+
+// adoptedArchive returns an archive artifact adopted from a previous run
+// that matches the archive that is about to be created.
+func adoptedArchive(ctx *context.Context, id, name, path string) *artifact.Artifact {
+	if !ctx.Resume {
+		return nil
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil
+	}
+	for _, a := range ctx.Artifacts.Snapshot() {
+		if a.Type != artifact.UploadableArchive || !resume.Adopted(ctx, a) || a.Name != name || a.ID() != id {
+			continue
+		}
+		ap, err := filepath.Abs(a.Path)
+		if err == nil && ap == abs {
+			return a
+		}
+	}
+	return nil
+}
+
 func create(ctx *context.Context, arch config.Archive, binaries []*artifact.Artifact, format string) (err error) {
 	template := tmpl.New(ctx)
 	if len(binaries) > 0 {
@@ -185,8 +227,28 @@ func create(ctx *context.Context, arch config.Archive, binaries []*artifact.Arti
 		return err
 	}
 	if _, err = os.Stat(archivePath); !errors.Is(err, fs.ErrNotExist) {
-		lock.Unlock()
-		return fmt.Errorf("archive named %s already exists. Check your archive name template", archivePath)
+		if err != nil {
+			lock.Unlock()
+			return err
+		}
+		if existing := adoptedArchive(ctx, arch.ID, folder+"."+format, archivePath); existing != nil {
+			lock.Unlock()
+			resume.Claim(ctx, existing)
+			log.WithField("name", archivePath).Info("reusing existing archive")
+			return nil
+		}
+		if ctx.Resume {
+			// The file exists but was not recorded as completed, so it
+			// was left behind by an interrupted run and cannot be trusted.
+			log.WithField("name", archivePath).Debug("removing incomplete archive from interrupted run")
+			if err := os.Remove(archivePath); err != nil {
+				lock.Unlock()
+				return err
+			}
+		} else {
+			lock.Unlock()
+			return fmt.Errorf("archive named %s already exists. Check your archive name template", archivePath)
+		}
 	}
 	archiveFile, err := os.Create(archivePath)
 	if err != nil {
@@ -317,6 +379,13 @@ func skip(ctx *context.Context, archive config.Archive, binaries []*artifact.Art
 		log.WithField("binary", binary.Name).
 			WithField("name", finalName).
 			Info("archiving")
+
+		if ctx.Resume {
+			if existing := adoptedBinary(ctx, archive.ID, finalName, binary.Path); existing != nil {
+				resume.Claim(ctx, existing)
+				continue
+			}
+		}
 
 		art := &artifact.Artifact{
 			Type:      artifact.UploadableBinary,

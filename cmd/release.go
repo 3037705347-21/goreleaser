@@ -12,6 +12,7 @@ import (
 	"github.com/goreleaser/goreleaser/v2/internal/middleware/logging"
 	"github.com/goreleaser/goreleaser/v2/internal/middleware/skip"
 	"github.com/goreleaser/goreleaser/v2/internal/pipeline"
+	"github.com/goreleaser/goreleaser/v2/internal/resume"
 	"github.com/goreleaser/goreleaser/v2/internal/skips"
 	"github.com/goreleaser/goreleaser/v2/pkg/context"
 	"github.com/spf13/cobra"
@@ -116,9 +117,14 @@ func releaseProject(parent stdctx.Context, options releaseOpts) error {
 			pipe,
 			logging.Log(
 				pipe.String(),
-				errhandler.Handle(pipe.Run),
+				errhandler.Handle(
+					pipe.Run,
+				),
 			),
 		)(ctx); err != nil {
+			return decorateWithCtxErr(ctx, err, "release", after(start))
+		}
+		if err := resume.Checkpoint(ctx); err != nil {
 			return decorateWithCtxErr(ctx, err, "release", after(start))
 		}
 	}

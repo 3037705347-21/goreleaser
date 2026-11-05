@@ -10,6 +10,7 @@ import (
 	"github.com/caarlos0/log"
 	"github.com/goreleaser/goreleaser/v2/internal/artifact"
 	"github.com/goreleaser/goreleaser/v2/internal/gio"
+	"github.com/goreleaser/goreleaser/v2/internal/resume"
 	"github.com/goreleaser/goreleaser/v2/internal/tmpl"
 	"github.com/goreleaser/goreleaser/v2/pkg/context"
 )
@@ -31,8 +32,16 @@ func (Pipe) Run(ctx *context.Context) error {
 func (MetaPipe) String() string                 { return "writing release metadata" }
 func (MetaPipe) Run(ctx *context.Context) error { return writeMetadata(ctx) }
 
-func (ArtifactsPipe) String() string                 { return "writing artifacts metadata" }
-func (ArtifactsPipe) Run(ctx *context.Context) error { return writeArtifacts(ctx) }
+func (ArtifactsPipe) String() string { return "writing artifacts metadata" }
+func (ArtifactsPipe) Run(ctx *context.Context) error {
+	// When resuming, drop artifacts that no pipe reaffirmed and files
+	// the previous run owned but the current configuration no longer
+	// produces, before persisting the final manifest.
+	if err := resume.Finalize(ctx); err != nil {
+		return err
+	}
+	return resume.WriteArtifacts(ctx)
+}
 
 func writeMetadata(ctx *context.Context) error {
 	const name = "metadata.json"
@@ -53,16 +62,6 @@ func writeMetadata(ctx *context.Context) error {
 		Path: path,
 		Type: artifact.Metadata,
 	})
-	return err
-}
-
-func writeArtifacts(ctx *context.Context) error {
-	_ = ctx.Artifacts.Visit(func(a *artifact.Artifact) error {
-		a.TypeS = a.Type.String()
-		a.Path = filepath.ToSlash(filepath.Clean(a.Path))
-		return nil
-	})
-	_, err := writeJSON(ctx, ctx.Artifacts.List(), "artifacts.json")
 	return err
 }
 

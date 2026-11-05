@@ -11,10 +11,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/goreleaser/goreleaser/v2/internal/artifact"
+	"github.com/goreleaser/goreleaser/v2/internal/resume"
 	"github.com/goreleaser/goreleaser/v2/internal/skips"
 	"github.com/goreleaser/goreleaser/v2/internal/testctx"
 	"github.com/goreleaser/goreleaser/v2/internal/testlib"
@@ -1670,4 +1672,123 @@ func TestDefaultDeprecatd(t *testing.T) {
 	require.True(t, ctx.Deprecated)
 	require.Equal(t, "tar.gz", ctx.Config.Archives[0].Formats[0])
 	require.Equal(t, "zip", ctx.Config.Archives[0].FormatOverrides[0].Formats[0])
+}
+
+func TestResumeReusesArchive(t *testing.T) {
+	folder := testlib.Mktmp(t)
+	dist := filepath.Join(folder, "dist")
+	require.NoError(t, os.Mkdir(dist, 0o755))
+	binPath := filepath.Join(folder, "mybin")
+	require.NoError(t, os.WriteFile(binPath, []byte("bin"), 0o755))
+
+	archivePath := filepath.Join(dist, "myarchive.tar.gz")
+	require.NoError(t, os.WriteFile(archivePath, []byte("adopted"), 0o644))
+
+	cfg := config.Archive{
+		ID:           "default",
+		NameTemplate: "myarchive",
+		Files:        []config.File{{Source: "no-such-file-*"}},
+	}
+	bin := &artifact.Artifact{
+		Name:   "mybin",
+		Path:   binPath,
+		Type:   artifact.Binary,
+		Goos:   "linux",
+		Goarch: "amd64",
+		Extra:  map[string]any{artifact.ExtraID: "default"},
+	}
+	old := &artifact.Artifact{
+		Name:   "myarchive.tar.gz",
+		Path:   archivePath,
+		Type:   artifact.UploadableArchive,
+		Goos:   "linux",
+		Goarch: "amd64",
+		Extra:  map[string]any{artifact.ExtraID: "default", artifact.ExtraAdopted: true},
+	}
+	ctx := testctx.WrapWithCfg(t.Context(), config.Project{Dist: dist})
+	ctx.Resume = true
+	ctx.ResumeClaimed = &sync.Map{}
+	ctx.Artifacts.Add(bin)
+	ctx.Artifacts.Add(old)
+
+	require.NoError(t, create(ctx, cfg, []*artifact.Artifact{bin}, "tar.gz"))
+
+	// the archive was not recreated
+	bts, err := os.ReadFile(archivePath)
+	require.NoError(t, err)
+	require.Equal(t, "adopted", string(bts))
+
+	// and the adopted record was claimed, not duplicated
+	list := ctx.Artifacts.Filter(artifact.ByType(artifact.UploadableArchive)).List()
+	require.Len(t, list, 1)
+	require.False(t, resume.Adopted(ctx, list[0]))
+}
+
+func TestResumeReplacesIncompleteArchive(t *testing.T) {
+	folder := testlib.Mktmp(t)
+	dist := filepath.Join(folder, "dist")
+	require.NoError(t, os.Mkdir(dist, 0o755))
+	binPath := filepath.Join(folder, "mybin")
+	require.NoError(t, os.WriteFile(binPath, []byte("bin"), 0o755))
+
+	archivePath := filepath.Join(dist, "myarchive.tar.gz")
+	// interrupted run left an unrecorded, truncated file
+	require.NoError(t, os.WriteFile(archivePath, []byte("not really a tar.gz"), 0o644))
+
+	cfg := config.Archive{
+		ID:           "default",
+		NameTemplate: "myarchive",
+		Files:        []config.File{{Source: "no-such-file-*"}},
+	}
+	bin := &artifact.Artifact{
+		Name:   "mybin",
+		Path:   binPath,
+		Type:   artifact.Binary,
+		Goos:   "linux",
+		Goarch: "amd64",
+		Extra:  map[string]any{artifact.ExtraID: "default"},
+	}
+	ctx := testctx.WrapWithCfg(t.Context(), config.Project{Dist: dist})
+	ctx.Resume = true
+	ctx.ResumeClaimed = &sync.Map{}
+	ctx.Artifacts.Add(bin)
+
+	require.NoError(t, create(ctx, cfg, []*artifact.Artifact{bin}, "tar.gz"))
+
+	bts, err := os.ReadFile(archivePath)
+	require.NoError(t, err)
+	require.Equal(t, []byte{0x1f, 0x8b}, bts[:2])
+
+	list := ctx.Artifacts.Filter(artifact.ByType(artifact.UploadableArchive)).List()
+	require.Len(t, list, 1)
+	require.Equal(t, "myarchive.tar.gz", list[0].Name)
+}
+
+func TestFreshRunStillErrorsOnExistingArchive(t *testing.T) {
+	folder := testlib.Mktmp(t)
+	dist := filepath.Join(folder, "dist")
+	require.NoError(t, os.Mkdir(dist, 0o755))
+	binPath := filepath.Join(folder, "mybin")
+	require.NoError(t, os.WriteFile(binPath, []byte("bin"), 0o755))
+	archivePath := filepath.Join(dist, "myarchive.tar.gz")
+	require.NoError(t, os.WriteFile(archivePath, []byte("x"), 0o644))
+
+	cfg := config.Archive{
+		ID:           "default",
+		NameTemplate: "myarchive",
+		Files:        []config.File{{Source: "no-such-file-*"}},
+	}
+	bin := &artifact.Artifact{
+		Name:   "mybin",
+		Path:   binPath,
+		Type:   artifact.Binary,
+		Goos:   "linux",
+		Goarch: "amd64",
+		Extra:  map[string]any{artifact.ExtraID: "default"},
+	}
+	ctx := testctx.WrapWithCfg(t.Context(), config.Project{Dist: dist})
+	ctx.Artifacts.Add(bin)
+
+	err := create(ctx, cfg, []*artifact.Artifact{bin}, "tar.gz")
+	require.ErrorContains(t, err, "already exists")
 }

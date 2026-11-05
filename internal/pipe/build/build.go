@@ -6,14 +6,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/caarlos0/log"
 	"github.com/goreleaser/go-shellwords"
+	"github.com/goreleaser/goreleaser/v2/internal/artifact"
 	"github.com/goreleaser/goreleaser/v2/internal/builders/base"
 	"github.com/goreleaser/goreleaser/v2/internal/deprecate"
 	"github.com/goreleaser/goreleaser/v2/internal/gerrors"
 	"github.com/goreleaser/goreleaser/v2/internal/ids"
+	"github.com/goreleaser/goreleaser/v2/internal/resume"
 	"github.com/goreleaser/goreleaser/v2/internal/semerrgroup"
 	"github.com/goreleaser/goreleaser/v2/internal/shell"
 	"github.com/goreleaser/goreleaser/v2/internal/skips"
@@ -136,6 +139,12 @@ func runPipeOnBuild(ctx *context.Context, g semerrgroup.Group, build config.Buil
 			if err := buildTarget(ctx, build, target); err != nil {
 				return gerrors.Wrap(err, gerrors.WithDetails("target", target))
 			}
+			// Persist completed targets as soon as they finish, so an
+			// interruption from this point on can skip them on the next
+			// run. No-op for fresh builds.
+			if err := resume.Checkpoint(ctx); err != nil {
+				return gerrors.Wrap(err, gerrors.WithDetails("target", target))
+			}
 			return nil
 		})
 	}
@@ -145,6 +154,10 @@ func buildTarget(ctx *context.Context, build config.Build, target string) error 
 	opts, err := buildOptionsForTarget(ctx, build, target)
 	if err != nil {
 		return err
+	}
+
+	if reuseBuiltTarget(ctx, build, target, opts) {
+		return nil
 	}
 
 	if err := os.MkdirAll(filepath.Dir(opts.Path), 0o755); err != nil {
@@ -216,6 +229,77 @@ func runHook(ctx *context.Context, opts builders.Options, buildEnv []string, hoo
 
 func doBuild(ctx *context.Context, build config.Build, opts builders.Options) error {
 	return builders.For(build.Builder).Build(ctx, build, opts)
+}
+
+// reuseBuiltTarget reports whether all artifacts produced for the given
+// target already exist on disk and can be adopted from a previous run,
+// claiming them so the build is skipped entirely.
+func reuseBuiltTarget(ctx *context.Context, build config.Build, target string, opts *builders.Options) bool {
+	if !ctx.Resume {
+		return false
+	}
+
+	abs, err := filepath.Abs(opts.Path)
+	if err != nil {
+		return false
+	}
+	dir := filepath.Dir(abs)
+	// builders like python's emit wheel/sdist without a target; the
+	// unique build directory ties them to this target.
+	dirPrefix := build.ID + "_"
+
+	var candidates []*artifact.Artifact
+	for _, a := range ctx.Artifacts.Snapshot() {
+		ap, err := filepath.Abs(a.Path)
+		if err != nil || filepath.Dir(ap) != dir {
+			continue
+		}
+		if a.Target == target || (a.Target == "" && strings.HasPrefix(filepath.Base(dir), dirPrefix)) {
+			candidates = append(candidates, a)
+		}
+	}
+
+	if len(candidates) == 0 {
+		return false
+	}
+
+	// For targets with a primary binary it must have been completed,
+	// otherwise the target is rebuilt even if secondary artifacts (e.g.
+	// C headers) exist. Builders without a primary output (wheels,
+	// sdists) are considered complete if any adopted file is present.
+	primaryPresent := slices.ContainsFunc(candidates, func(a *artifact.Artifact) bool {
+		ap, err := filepath.Abs(a.Path)
+		return err == nil && ap == abs
+	})
+	targetless := true
+	for _, a := range candidates {
+		if a.Target != "" {
+			targetless = false
+			break
+		}
+	}
+	if !primaryPresent && !targetless {
+		return false
+	}
+
+	for _, a := range candidates {
+		ap, err := filepath.Abs(a.Path)
+		if err != nil {
+			return false
+		}
+		info, err := os.Stat(ap)
+		if err != nil || info.IsDir() {
+			return false
+		}
+	}
+
+	for _, a := range candidates {
+		resume.Claim(ctx, a)
+	}
+	log.WithField("target", target).
+		WithField("artifacts", len(candidates)).
+		Info("reusing previously built artifacts")
+	return true
 }
 
 func buildOptionsForTarget(ctx *context.Context, build config.Build, target string) (*builders.Options, error) {

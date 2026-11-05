@@ -645,6 +645,13 @@ func create(ctx *context.Context, fpm config.NFPM, format string, artifacts []*a
 	path := filepath.Join(ctx.Config.Dist, packageFilename)
 	log.WithField("file", path).Info("creating")
 	w, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil && errors.Is(err, os.ErrExist) && ctx.Resume {
+		// not recorded as completed, so it was left by an interrupted run
+		log.WithField("file", path).Debug("removing incomplete package from interrupted run")
+		if rmErr := os.Remove(path); rmErr == nil {
+			w, err = os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		}
+	}
 	if err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return fmt.Errorf("package file already exists: %s: %w", path, err)

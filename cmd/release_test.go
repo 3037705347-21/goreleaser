@@ -1,9 +1,13 @@
 package cmd
 
 import (
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/goreleaser/goreleaser/v2/internal/artifact"
 	"github.com/goreleaser/goreleaser/v2/internal/pipe/changelog"
 	"github.com/goreleaser/goreleaser/v2/internal/skips"
 	"github.com/goreleaser/goreleaser/v2/internal/testctx"
@@ -199,4 +203,83 @@ func TestReleaseFlags(t *testing.T) {
 			clean: true,
 		}).Clean)
 	})
+}
+
+func TestReleaseResumeAfterInterruption(t *testing.T) {
+	setup(t)
+
+	args := []string{"--snapshot", "--skip=publish", "--timeout=2m", "--parallelism=2", "--deprecated"}
+
+	// first, a full snapshot release (build + archive + checksums)
+	cmd := newReleaseCmd()
+	cmd.cmd.SetArgs(args)
+	require.NoError(t, cmd.cmd.Execute())
+
+	matches, err := filepath.Glob("./dist/*_linux_amd64.tar")
+	require.NoError(t, err)
+	require.Len(t, matches, 1)
+	archivePath := matches[0]
+	binPath := "./dist/fake_linux_amd64_v1/fake_snapshot"
+	require.FileExists(t, binPath)
+
+	// reuse is observable via preserved mtimes
+	oldTime := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
+	require.NoError(t, os.Chtimes(archivePath, oldTime, oldTime))
+	require.NoError(t, os.Chtimes(binPath, oldTime, oldTime))
+	createFile(t, "./dist/manual.txt", "manual")
+
+	// second run: everything is complete, so binary and archive are reused
+	cmd = newReleaseCmd()
+	cmd.cmd.SetArgs(args)
+	require.NoError(t, cmd.cmd.Execute())
+
+	for _, p := range []string{archivePath, binPath} {
+		st, err := os.Stat(p)
+		require.NoError(t, err)
+		require.Equal(t, oldTime.Unix(), st.ModTime().Unix(), "%s should be reused", p)
+	}
+	require.FileExists(t, "./dist/manual.txt")
+
+	// simulate an interruption while (re)creating the archive: the file is
+	// truncated and its manifest entry is gone
+	require.NoError(t, os.Remove(archivePath))
+	manifest := "./dist/artifacts.json"
+	bts, err := os.ReadFile(manifest)
+	require.NoError(t, err)
+	var arts []*artifact.Artifact
+	require.NoError(t, json.Unmarshal(bts, &arts))
+	kept := arts[:0]
+	for _, a := range arts {
+		if filepath.Base(a.Path) == filepath.Base(archivePath) {
+			continue
+		}
+		kept = append(kept, a)
+	}
+	out, err := json.Marshal(kept)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(manifest, out, 0o644))
+
+	// third run: rebuilds only the archive, reuses the binary
+	cmd = newReleaseCmd()
+	cmd.cmd.SetArgs(args)
+	require.NoError(t, cmd.cmd.Execute())
+	require.FileExists(t, archivePath)
+	st, err := os.Stat(archivePath)
+	require.NoError(t, err)
+	require.NotEqual(t, oldTime.Unix(), st.ModTime().Unix(), "archive should have been rebuilt")
+	st, err = os.Stat(binPath)
+	require.NoError(t, err)
+	require.Equal(t, oldTime.Unix(), st.ModTime().Unix(), "binary should still be reused")
+	require.FileExists(t, "./dist/manual.txt")
+
+	// fourth run converges: the rebuilt archive is now reused as-is
+	st, err = os.Stat(archivePath)
+	require.NoError(t, err)
+	rebuiltTime := st.ModTime().Unix()
+	cmd = newReleaseCmd()
+	cmd.cmd.SetArgs(args)
+	require.NoError(t, cmd.cmd.Execute())
+	st, err = os.Stat(archivePath)
+	require.NoError(t, err)
+	require.Equal(t, rebuiltTime, st.ModTime().Unix())
 }

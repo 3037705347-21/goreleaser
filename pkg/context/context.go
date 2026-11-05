@@ -12,6 +12,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/goreleaser/goreleaser/v2/internal/artifact"
@@ -104,12 +105,25 @@ type Context struct {
 	SingleTarget      bool
 	SkipTokenCheck    bool
 	Clean             bool
-	PreRelease        bool
-	Deprecated        bool
-	Parallelism       int
-	Semver            Semver
-	Runtime           Runtime
-	Skips             map[string]bool
+	// Resume reports whether the current run is resuming a previous,
+	// interrupted run into a non-empty distribution directory.
+	Resume bool
+	// ResumeOwned holds the absolute paths of files the previous run
+	// generated. It is populated when a run is resumed and is used to
+	// remove artifacts that no longer match the current configuration.
+	// Files that were not produced by the tool are never listed here and
+	// are left untouched.
+	ResumeOwned []string
+	// ResumeClaimed tracks adopted artifacts (by pointer) that a pipe
+	// reaffirmed during a resumed run. It is initialized when a run is
+	// resumed and is nil otherwise.
+	ResumeClaimed *sync.Map
+	PreRelease    bool
+	Deprecated    bool
+	Parallelism   int
+	Semver        Semver
+	Runtime       Runtime
+	Skips         map[string]bool
 
 	NotifiedDeprecations map[string]struct{}
 }

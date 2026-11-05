@@ -257,6 +257,13 @@ const (
 	ExtraChecksumOf = "ChecksumOf"
 	ExtraBuilder    = "Builder"
 	ExtranDynLink   = "DynamicallyLinked"
+
+	// ExtraAdopted marks an artifact that was produced by a previous,
+	// interrupted run and adopted when resuming.
+	//
+	// It is an in-memory only marker and is never serialized to
+	// artifacts.json.
+	ExtraAdopted = "_adopted"
 )
 
 // Extras represents the extra fields in an artifact.
@@ -265,8 +272,9 @@ type Extras map[string]any
 func (e Extras) MarshalJSON() ([]byte, error) {
 	m := map[string]any{}
 	for k, v := range e {
-		if k == ExtraRefresh {
+		if k == ExtraRefresh || k == ExtraAdopted {
 			// refresh is a func, so we can't serialize it.
+			// adopted is an in-memory only marker.
 			continue
 		}
 		m[k] = v
@@ -476,6 +484,14 @@ func (artifacts *Artifacts) List() []*Artifact {
 	artifacts.lock.Lock()
 	defer artifacts.lock.Unlock()
 	return artifacts.items
+}
+
+// Snapshot returns a copy of the current artifact list. It is safe to
+// marshal while other goroutines keep adding artifacts.
+func (artifacts *Artifacts) Snapshot() []*Artifact {
+	artifacts.lock.Lock()
+	defer artifacts.lock.Unlock()
+	return slices.Clone(artifacts.items)
 }
 
 // GroupByID groups the artifacts by their ID.

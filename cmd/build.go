@@ -20,6 +20,7 @@ import (
 	"github.com/goreleaser/goreleaser/v2/internal/middleware/skip"
 	"github.com/goreleaser/goreleaser/v2/internal/pipe/git"
 	"github.com/goreleaser/goreleaser/v2/internal/pipeline"
+	"github.com/goreleaser/goreleaser/v2/internal/resume"
 	"github.com/goreleaser/goreleaser/v2/internal/skips"
 	"github.com/goreleaser/goreleaser/v2/pkg/config"
 	"github.com/goreleaser/goreleaser/v2/pkg/context"
@@ -136,6 +137,9 @@ func buildProject(parent stdctx.Context, options buildOpts) error {
 				errhandler.Handle(pipe.Run),
 			),
 		)(ctx); err != nil {
+			return decorateWithCtxErr(ctx, err, "build", after(start))
+		}
+		if err := resume.Checkpoint(ctx); err != nil {
 			return decorateWithCtxErr(ctx, err, "build", after(start))
 		}
 	}
